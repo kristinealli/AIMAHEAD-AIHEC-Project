@@ -1,0 +1,87 @@
+---
+title: "Synthetic model helper tests"
+output: html_notebook
+---
+
+**Measures:** whether category encoding, missing-response handling, weighting, and the run-file naming convention behave as expected using synthetic data.
+
+
+## Load shared code
+
+Loads shared helpers without incrementing the actual research counter.
+
+```{r load-shared-code}
+# Set the project root, then load R code from the shared R Notebooks.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+```
+
+
+## Assert helper behavior
+
+Checks that missing inputs are encoded, FMD missing labels stay missing, AUROC handles ties, and the output suffix contains an increment.
+
+```{r assert-helper-behavior}
+check_packages(c("data.table", "Matrix"))
+synthetic <- data.table::data.table(
+    YEAR = c(2021L, 2021L, 2021L, 2021L),
+    STATE = c(1L, 1L, 1L, 1L),
+    STRAT = 1L,
+    PSU = c(1L, 1L, 2L, 2L),
+    RAW_WEIGHT = c(1, 1, 1, 1),
+    FMD = c(0, 1, NA_real_, 1),
+    AIAN_ALONE = c(TRUE, FALSE, NA, TRUE),
+    PHYSHLTH_DAYS = c(0, 14, NA_real_, 5),
+    GENHLTH_CLEAN = c(1, NA_real_, 3, 2),
+    AGE_BAND = c("18-34", "35-49", "50-64", NA_character_),
+    SEX_CLEAN = c("Female", "Male", "Female", "Male"),
+    EDU_CLEAN = c("HS", "College grad", NA_character_, "Some college"),
+    INCOME_BAND = c("<25k", NA_character_, "75k+", "25-49k")
+)
+processed <- prepare_features(synthetic)
+stopifnot(all(!is.na(processed[, ..feature_names])))
+stopifnot(processed$INCOME_BAND[2] == "Missing")
+stopifnot(!valid_outcome(processed$FMD[3]))
+stopifnot(abs(weighted_auc(c(0, 1), c(0.5, 0.5), c(1, 1)) - 0.5) < 1e-12)
+stopifnot(abs(weighted_mean(c(0, 1), c(1, 3)) - 0.75) < 1e-12)
+# Test the artifact naming convention without creating any real run or artifact.
+run_context <- list(id = "0042", models = tempdir())
+stopifnot(grepl("_run_0042\\.rds$", artifact_path("models", "05_logistic")))
+rm(run_context)
+cat("[PASS] Synthetic input, categories, metrics, and run-suffix tests.\n")
+```
+

@@ -1,0 +1,154 @@
+---
+title: "14 — Run the three additional insight analyses"
+output: html_notebook
+---
+
+**Purpose:** run the additional research diagnostics as part of the complete
+study workflow. This notebook does not retrain any model. It reads the frozen
+model and 2023–2025 checkpoints from the current numbered run and writes the
+additional charts, tables, and notebook HTML to that same run.
+
+## Attach the frozen model run
+
+The runner selects the most recent run that has the required saved model and
+scored data. To choose a specific run, set `ATG_ADDON_SOURCE_RUN_ID` before
+knitting, e.g. `Sys.setenv(ATG_ADDON_SOURCE_RUN_ID = "0001")`.
+
+```{r initialize}
+# Locate the project before accessing shared functions or output folders.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+# Load all R expressions from a shared .Rmd module without calling source() on an Rmd.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    lines <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Incomplete code chunk in ", path)
+        }
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("addon_insight_helpers")
+check_packages(c("data.table", "ggplot2", "rmarkdown", "scales"))
+
+# When called from the master notebook, use its current run as the source.
+# This keeps every result in one numbered execution.
+original_dir <- file.path(project_root, "outputs")
+existing <- list.dirs(original_dir, recursive = FALSE, full.names = FALSE)
+possible <- sub("^run_", "", existing[grepl("^run_[0-9]{4,}$", existing)])
+
+source_complete <- function(run_id) {
+    original <- file.path(original_dir, paste0("run_", run_id))
+    needed <- c(
+        file.path("models", sprintf("05_frozen_selection_run_%s.rds", run_id)),
+        file.path("checkpoints", sprintf("02_selection_2023_run_%s.rds", run_id)),
+        file.path("checkpoints", sprintf("02_calibration_2024_run_%s.rds", run_id)),
+        file.path("checkpoints", sprintf("07_scored_2025_run_%s.rds", run_id))
+    )
+    if (!all(file.exists(file.path(original, needed)))) {
+        return(FALSE)
+    }
+    chosen <- readRDS(file.path(
+        original, "models", sprintf("05_frozen_selection_run_%s.rds", run_id)
+    ))$chosen_family
+    file.exists(file.path(
+        original, "models", sprintf("05_%s_run_%s.rds", chosen, run_id)
+    ))
+}
+
+current_run <- Sys.getenv("ATG_RUN_ID", unset = "")
+if (nzchar(current_run)) {
+    original_id <- current_run
+    addon_id <- current_run
+    run_context <- attach_run()
+} else {
+    # Preserve standalone execution for reviewing an already completed run.
+    ready <- possible[vapply(possible, source_complete, logical(1))]
+    requested <- Sys.getenv("ATG_ADDON_SOURCE_RUN_ID", unset = "")
+    if (nzchar(requested)) {
+        if (!requested %in% ready) {
+            stop("Requested source run is missing a required model or checkpoint: ", requested)
+        }
+        original_id <- requested
+    } else {
+        if (!length(ready)) {
+            stop("No complete source run found. Run the existing study first.")
+        }
+        original_id <- ready[which.max(as.integer(ready))]
+    }
+    Sys.unsetenv("ATG_RUN_ID")
+    addon_id <- start_new_run()
+    run_context <- attach_run()
+}
+Sys.setenv(ATG_SOURCE_RUN_ID = original_id)
+
+# Save traceable provenance without copying fitted models or source data.
+metadata <- data.frame(
+    addon_run = addon_id,
+    frozen_source_run = original_id,
+    method = "frozen-model additional diagnostics",
+    timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+)
+save_table(metadata, "14_addon_source_provenance")
+print(metadata)
+```
+
+## Execute the additional notebooks
+
+The three analyses reuse the same source model and the current numbered run.
+Graphs will appear in each rendered notebook and be saved to that run folder.
+
+```{r execute-addons}
+# Run the three additional analyses as part of the current master execution.
+stages <- c(
+    "15_Predictor_Changes_Across_Years.Rmd",
+    "16_Composition_Standardization.Rmd",
+    "17_Standardized_Gap_Uncertainty.Rmd"
+)
+
+for (stage in stages) {
+    output_name <- sprintf(
+        "%s_run_%s.nb.html",
+        tools::file_path_sans_ext(stage),
+        addon_id
+    )
+    cat("[ADD-ON] ", stage, " | run ", addon_id, "\n", sep = "")
+    rmarkdown::render(
+        input = file.path(project_root, "notebooks", stage),
+        output_file = output_name,
+        output_dir = run_context$notebooks,
+        knit_root_dir = project_root,
+        envir = new.env(parent = globalenv()),
+        quiet = FALSE
+    )
+    gc(verbose = FALSE)
+}
+
+cat("[COMPLETE] New diagnostic results in:", run_context$root, "\n")
+Sys.unsetenv(c("ATG_SOURCE_RUN_ID", "ATG_RUN_ID"))
+```

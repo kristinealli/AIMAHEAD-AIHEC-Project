@@ -1,0 +1,315 @@
+---
+title: "00 — Run the complete future-year study"
+output: html_notebook
+---
+
+Each time this master notebook is run, it allocates the next persistent run number and executes the numbered stage notebooks in order. The stages all share the same increment.
+
+The study first audits the BRFSS inputs, then prepares time-ordered data,
+validates candidate models on earlier survey years, selects a national model
+with 2023 data, calibrates probabilities with 2024 data, and evaluates the
+frozen workflow on 2025 data. The final stages summarize subgroup performance
+and prespecified descriptive or sensitivity analyses without changing the
+selected model.
+
+## Initialize project and increment
+
+Reads shared settings, allocates a unique run number, and creates empty output directories. Models from prior runs are never reused.
+
+```{r initialize-project-and-increment}
+# -----------------------------------------------------------------------------
+# Project-root discovery
+# -----------------------------------------------------------------------------
+
+# Searches upward from the current working directory for the project file.
+# Allows the notebook to locate the project when started from a subfolder.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+
+    repeat {
+        # Directory containing this file is the project root if it has the RStudio
+        # project file.
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+
+        parent <- dirname(current)
+
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+
+        current <- parent
+    }
+}
+
+
+# -----------------------------------------------------------------------------
+# Notebook working-directory configuration
+# -----------------------------------------------------------------------------
+
+# Resolves project location before constructing any module or output paths.
+project_root <- find_project_root()
+
+# Uses the project root as the working directory for subsequent chunks
+# evaluated by knitr.
+knitr::opts_knit$set(root.dir = project_root)
+
+
+# -----------------------------------------------------------------------------
+# Shared-module loader
+# -----------------------------------------------------------------------------
+
+# Extract and execute R code chunks from a shared R Markdown module.
+# Evaluate the code in each notebooks environment so functions and
+# configuration variables are available to the calling notebook.
+load_module <- function(name) {
+    path <- file.path(
+        project_root,
+        "R",
+        paste0(name, ".Rmd")
+    )
+
+    text <- readLines(path, warn = FALSE)
+
+    # Identify opening R chunk fences and standalone closing fences.
+    # Assumes the shared modules use this format.
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+
+    # Collect the code between each R opening fence and the next closing fence.
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+
+        # Require a closing fence and at least one intervening line.
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+
+        paste(
+            text[(start + 1L):(finish - 1L)],
+            collapse = "\n"
+        )
+    })
+
+    # Combine the extracted chunks in their original order, parse the R code,
+    # and execute it in the environment that called load_module().
+    eval(
+        parse(text = paste(blocks, collapse = "\n\n")),
+        envir = parent.frame()
+    )
+
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Shared configuration and utilities
+# -----------------------------------------------------------------------------
+
+# Load configuration first so the remaining modules can use shared settings.
+# The run manager defines run-allocation and artifact-management functions.
+# The helpers module defines validation, modeling, and metric utilities.
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+
+
+# -----------------------------------------------------------------------------
+# Analysis dependency check
+# -----------------------------------------------------------------------------
+
+# Verify the packages required by this workflow before allocating a new run.
+# check_packages() stops with instructions if a dependency is unavailable;
+# it does not install packages.
+check_packages(c(
+    "data.table",
+    "ggplot2",
+    "glmnet",
+    "ranger",
+    "Matrix",
+    "survey",
+    "rmarkdown",
+    "scales"
+))
+
+
+# -----------------------------------------------------------------------------
+# Fresh run allocation
+# -----------------------------------------------------------------------------
+
+# Discard an inherited or leftover run ID before starting a complete execution.
+# This prevents the master notebook from reusing that ID.
+if (nzchar(Sys.getenv("ATG_RUN_ID", unset = ""))) {
+    Sys.unsetenv("ATG_RUN_ID")
+}
+
+# Allocates one new persistent increment and publishes its environment variable.
+# Stage notebooks attach to the run.
+run_id <- start_new_run()
+
+# Resolve the new run's directories for the artifact-saving helpers.
+run_context <- attach_run()
+
+
+# -----------------------------------------------------------------------------
+# Run confirmation
+# -----------------------------------------------------------------------------
+
+# Display the allocated increment in the notebook output for traceability.
+cat("[NEW STUDY RUN] Increment", run_id, "\n")
+```
+
+
+## Render the notebook stages
+
+Executes preprocessing, optional PCA, temporal model development, 2023 selection, 2024 calibration, 2025 evaluation, AI/AN auditing, sensitivity checks, and the research summary. Every created graph prints in its notebook.
+
+```{r render-the-notebook-stages}
+# -----------------------------------------------------------------------------
+# Core notebook sequence
+# -----------------------------------------------------------------------------
+
+# Defines stages in execution order.
+# Earlier stages prepare the data and modeling artifacts used by later stages.
+stage_names <- c(
+    "01_Audit_Data.Rmd",
+    "02_Prepare_Annual_Sets.Rmd",
+    "03_Class_PCA_Optional.Rmd",
+    "04_Forward_Year_Validation.Rmd",
+    "05_Select_Model_2023.Rmd",
+    "05b_Feature_Group_Analysis.Rmd",
+    "06_Calibrate_2024.Rmd",
+    "07_Evaluate_2025.Rmd",
+    "08_AI_AN_Equity_Evaluation.Rmd",
+    "09_Sensitivity_Analysis.Rmd",
+    "11_Annual_Shifts.Rmd"
+)
+
+
+# -----------------------------------------------------------------------------
+# For Optional diagnostic stages
+# -----------------------------------------------------------------------------
+
+# Append the PSU-bootstrap analysis only when enabled in the configuration.
+if (run_psu_bootstrap) {
+    stage_names <- c(
+        stage_names,
+        "12_PSU_Bootstrap_AUROC.Rmd"
+    )
+}
+
+# Append the 2023 predictor-permutation analysis only when enabled.
+if (run_predictor_permutation) {
+    stage_names <- c(
+        stage_names,
+        "13_2023_Permutation_Importance.Rmd"
+    )
+}
+
+# Run the additional insight notebooks in the same numbered execution. Notebook 14
+# links these stages to the current run.
+stage_names <- c(
+    stage_names,
+    "14_Run_Additional_Insights.Rmd"
+)
+
+
+# -----------------------------------------------------------------------------
+# Final synthesis stage
+# -----------------------------------------------------------------------------
+
+# Runs the findings summary last so it can use outputs from all preceding
+# stages, includes whichever optional diagnostics were enabled.
+stage_names <- c(
+    stage_names,
+    "10_Summarize_Findings.Rmd"
+)
+
+
+# -----------------------------------------------------------------------------
+# Sequential notebook rendering
+# -----------------------------------------------------------------------------
+
+# Render one stage at a time so upstream outputs are available before
+# downstream notebooks begin. Every rendered HTML file is written to the
+# active run's notebooks directory.
+for (stage_name in stage_names) {
+    # Locate the source notebook within the project.
+    input_file <- file.path(
+        project_root,
+        "notebooks",
+        stage_name
+    )
+
+    # Give the rendered notebook the same run suffix as the other artifacts.
+    output_file <- sprintf(
+        "%s_run_%s.nb.html",
+        tools::file_path_sans_ext(stage_name),
+        run_context$id
+    )
+
+    target <- file.path(run_context$notebooks, output_file)
+
+    # Pre-render existence check.
+    # Stops to not replace notebook run output.
+    if (file.exists(target)) {
+        stop("Stage output already exists: ", target)
+    }
+
+    # Identifies the stage and run in the master notebook's progress output.
+    cat(
+        "\n[NOTEBOOK] ",
+        stage_name,
+        " | run ",
+        run_context$id,
+        "\n",
+        sep = ""
+    )
+
+    # Render into the current run's notebook directory; no stage HTML is
+    # written beside the source Rmd file.
+    #
+    # Use the project root for chunk execution so relative project paths
+    # resolve consistently across stages.
+    #
+    # Provides each stage a fresh evaluation environment. Parent is the
+    # global environment, so global objects remain accessible.
+    #
+    # Keep rendering messages visible to support progress checks and debugging.
+    rmarkdown::render(
+        input = input_file,
+        output_file = output_file,
+        output_dir = run_context$notebooks,
+        knit_root_dir = project_root,
+        envir = new.env(parent = globalenv()),
+        quiet = FALSE
+    )
+
+    # Garbage collection after each successfully rendered stage.
+    # Objects that remain referenced are not removed.
+    gc(verbose = FALSE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Successful-completion message
+# -----------------------------------------------------------------------------
+
+# This point is reached only if every selected render call finishes
+# without an unhandled error.
+cat(
+    "\n[FINISHED] All outputs for increment ",
+    run_context$id,
+    " saved.\n",
+    sep = ""
+)
+
+
+# -----------------------------------------------------------------------------
+# Session cleanup
+# -----------------------------------------------------------------------------
+
+# Clears the environment-based run ID after successful completion.
+Sys.unsetenv("ATG_RUN_ID")
+```

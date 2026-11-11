@@ -1,0 +1,744 @@
+---
+title: "Data and modeling utilities"
+output: html_notebook
+---
+
+Shared utilities for reading and validating data, encoding predictors,
+fitting classifiers, generating predictions, and calculating weighted
+performance metrics.
+
+Defines functions for use by the numbered notebooks. Individual
+notebooks control temporal splits, eligibility filtering, model selection,
+and when these functions are executed.
+
+## Input validation and transformations
+
+These functions check the input schema and survey years, apply a consistent
+predictor encoding, and distinguish missing predictors from unknown outcomes.
+
+Recognized missing predictor responses are handled as explicit categories.
+Invalid or unknown outcomes remain "missing" and individual notebooks will
+exclude those outcomes from supervised model fitting, as needed.
+
+```{r input-validation-and-transformations}
+# -----------------------------------------------------------------------------
+# Package dependencies
+# -----------------------------------------------------------------------------
+
+# Check that required packages are installed. Stops and alerts.
+check_packages <- function(
+    packages = c("data.table", "ggplot2", "glmnet", "ranger", "Matrix")
+) {
+    missing <- packages[
+        !vapply(packages, requireNamespace, logical(1), quietly = TRUE)
+    ]
+
+    if (length(missing)) {
+        stop(
+            "Missing R packages: ",
+            paste(missing, collapse = ", "),
+            ". Run notebooks/00_Install_Packages.Rmd first."
+        )
+    }
+
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Input readers and schema validation
+# -----------------------------------------------------------------------------
+
+# Reads data file (RDS) and verifies fields and years expected by the workflow
+# are present.
+read_input <- function(path, years) {
+    if (!file.exists(path)) {
+        stop("Required input file is missing: ", path)
+    }
+
+    data <- data.table::as.data.table(readRDS(path))
+
+    # Addresses inheritance, individual year input inherits year from function.
+    # Multi-year inputs must already identify the year of each record.
+    if (!"YEAR" %in% names(data) && length(years) == 1L) {
+        data[, YEAR := years]
+    }
+
+    required <- c(
+        "YEAR",
+        "STATE",
+        "STRAT",
+        "PSU",
+        "RAW_WEIGHT",
+        "FMD",
+        "AIAN_ALONE",
+        "PHYSHLTH_DAYS",
+        "GENHLTH_CLEAN",
+        "AGE_BAND",
+        "SEX_CLEAN",
+        "EDU_CLEAN",
+        "INCOME_BAND"
+    )
+
+    missing <- setdiff(required, names(data))
+
+    if (length(missing)) {
+        stop(
+            "Missing input columns: ",
+            paste(missing, collapse = ", ")
+        )
+    }
+
+    # Confirms the expected set of years.
+    if (!setequal(unique(data$YEAR), years)) {
+        stop("Unexpected survey years in ", basename(path))
+    }
+
+    # Preserves record's position within this input file for traceability.
+    # This identifier is local to the file.
+    data[, source_row_id := seq_len(.N)]
+
+    data
+}
+
+
+# Load the historical file and require all years from 2014 through 2024.
+read_historical <- function() {
+    read_input(data_historical, 2014:2024)
+}
+
+
+# Load the held-out test file and confirm the 2025 survey year.
+read_test_year <- function() {
+    read_input(data_test, 2025L)
+}
+
+
+# -----------------------------------------------------------------------------
+# Validity checks and evaluation groups
+# -----------------------------------------------------------------------------
+
+# Accept only finite, positive survey and training weights.
+valid_weight <- function(weights) {
+    is.finite(weights) & weights > 0
+}
+
+
+# Accept only observed binary outcomes coded as 0 or 1.
+valid_outcome <- function(outcome) {
+    !is.na(outcome) & outcome %in% c(0, 1)
+}
+
+
+# Translate supplied AI/AN-alone indicator into evaluation-group labels.
+# The meaning of FALSE depends on the indicator's upstream coding.
+# Missing or otherwise unmatched values retain the unresolved label.
+race_group <- function(indicator) {
+    result <- rep("Unresolved/multiracial", length(indicator))
+
+    result[!is.na(indicator) & indicator == TRUE] <- primary_groups[1]
+    result[!is.na(indicator) & indicator == FALSE] <- primary_groups[2]
+
+    result
+}
+
+
+# -----------------------------------------------------------------------------
+# Categorical encoding
+# -----------------------------------------------------------------------------
+
+# Standardize non-response to an explicit "Missing" category.
+# Reject unexpected labels rather than silently creating new categories.
+strict_factor <- function(value, allowed_levels, variable) {
+    label <- trimws(as.character(value))
+
+    not_answered <- is.na(value) | label %in% c(
+        "",
+        "NA",
+        "NaN",
+        "Unknown",
+        "Refused",
+        "Don't know",
+        "Don't know/Not sure",
+        "Missing"
+    )
+
+    label[not_answered] <- "Missing"
+
+    unexpected <- setdiff(unique(label), allowed_levels)
+
+    if (length(unexpected)) {
+        stop(
+            variable,
+            " has unexpected levels: ",
+            paste(unexpected, collapse = ", ")
+        )
+    }
+
+    # Use the configured levels and ordering even when some categories
+    # are absent from the current subset.
+    factor(label, levels = allowed_levels)
+}
+
+
+# Prepares predictors, evaluation groups, and the labeled classification target.
+# Works on a copy so data.table assignments do not modify the data.
+prepare_features <- function(data) {
+    data <- data.table::copy(data.table::as.data.table(data))
+
+    # Convert physical-health days to numeric before checking their range.
+    physical_days <- suppressWarnings(
+        as.numeric(as.character(data$PHYSHLTH_DAYS))
+    )
+
+    # Observed numeric values must be whole numbers between 0 and 30.
+    invalid_days <- !is.na(physical_days) & (
+        physical_days < 0 |
+        physical_days > 30 |
+        physical_days != floor(physical_days)
+    )
+    # Any unexpected values indicate a problem with the annual recoding.
+    if (any(invalid_days)) {
+        stop("Unexpected physical-health day codes; inspect annual recoding")
+    }
+
+    # Map valid day counts into five configured intervals.
+    # Half-day boundaries separate the integer-valued categories.
+    physical_label <- cut(
+        physical_days,
+        breaks = c(-0.5, 0.5, 6.5, 13.5, 20.5, 30.5),
+        labels = factor_levels$physical_days_group[1:5],
+        include.lowest = TRUE
+    )
+
+    data[, physical_days_group := strict_factor(
+        physical_label,
+        factor_levels$physical_days_group,
+        "PHYSHLTH_DAYS"
+    )]
+
+    data[, general_health_group := strict_factor(
+        GENHLTH_CLEAN,
+        factor_levels$general_health_group,
+        "GENHLTH_CLEAN"
+    )]
+
+    # Applies categorical schema to the remaining predictors.
+    for (variable in c("AGE_BAND", "SEX_CLEAN", "EDU_CLEAN", "INCOME_BAND")) {
+        data.table::set(
+            data,
+            j = variable,
+            value = strict_factor(
+                data[[variable]],
+                factor_levels[[variable]],
+                variable
+            )
+        )
+    }
+
+    # Maintains evaluation-group membership separate from the model predictors.
+    data[, cohort := race_group(AIAN_ALONE)]
+
+    # Labels valid outcomes for classification without changing the FMD column.
+    # Unknown or invalid outcomes remain NA.
+    outcome_labels <- ifelse(
+        valid_outcome(data$FMD),
+        ifelse(data$FMD == 1, "Yes", "No"),
+        NA_character_
+    )
+
+    data[, outcome_factor := factor(
+        outcome_labels,
+        levels = c("No", "Yes")
+    )]
+
+    # Missing responses explicit predictor categories.
+    # Any remaining NA indicates an encoding problem.
+    if (anyNA(data[, ..feature_names])) {
+        stop("Feature encoding left missing predictor values")
+    }
+
+    data
+}
+
+
+# -----------------------------------------------------------------------------
+# Weight utilities
+# -----------------------------------------------------------------------------
+
+# Calculate weighted mean using finite values and valid weights.
+# Return NA when there are no usable observations.
+weighted_mean <- function(value, weights) {
+    keep <- is.finite(value) & valid_weight(weights)
+
+    if (!any(keep)) {
+        return(NA_real_)
+    }
+
+    sum(value[keep] * weights[keep]) / sum(weights[keep])
+}
+
+
+# Rescales training weights to have a mean of one.
+# Relative weights preserved while their scale is standardized.
+normalize_weights <- function(weights) {
+    if (any(!valid_weight(weights))) {
+        stop("Model training requires finite positive weights")
+    }
+
+    weights / mean(weights)
+}
+```
+
+## Model training and metrics
+
+These functions use the configured predictor schema to fit and evaluate
+classifiers for frequent mental distress.
+
+Individual notebooks supply appropriate training years and valid
+supervised outcomes. Computational subsampling is accounted for through
+inverse-probability adjustments to the training weights.
+
+The performance functions calculate weighted point estimates.
+
+```{r model-training-and-metrics}
+# -----------------------------------------------------------------------------
+# Development-sample construction
+# -----------------------------------------------------------------------------
+
+# Retain all AI/AN-alone records and sample the other groups within each year.
+sample_development <- function(data) {
+    data <- data.table::copy(data.table::as.data.table(data))
+
+    data[, sampling_group := race_group(AIAN_ALONE)]
+
+    groups <- unique(data$sampling_group)
+    collected <- list()
+    index <- 0L
+
+    for (group in groups) {
+        subset <- data[sampling_group == group]
+
+        # Keep the entire primary group; use configured targets for others.
+        cap <- if (group == primary_groups[1]) {
+            nrow(subset)
+        } else if (group == primary_groups[2]) {
+            comparison_cap
+        } else {
+            unknown_cap
+        }
+
+        count <- nrow(subset)
+
+        if (count == 0L) {
+            next
+        }
+
+        years <- sort(unique(subset$YEAR))
+
+        for (year in years) {
+            annual <- subset[YEAR == year]
+
+            # Allocate the group-level target in proportion to annual counts.
+            # Retain at least one record from each represented year.
+            # Rounding means the total is not necessarily an exact hard cap.
+            if (count <= cap) {
+                number <- nrow(annual)
+            } else {
+                number <- min(
+                    nrow(annual),
+                    max(
+                        1L,
+                        as.integer(
+                            round(as.numeric(cap) * nrow(annual) / count)
+                        )
+                    )
+                )
+            }
+
+            # Avoid random sampling when every annual record is retained.
+            # Otherwise, sample without replacement within this group-year.
+            choice <- if (number == nrow(annual)) {
+                seq_len(number)
+            } else {
+                sample.int(
+                    nrow(annual),
+                    size = number,
+                    replace = FALSE
+                )
+            }
+
+            sampled <- annual[choice]
+
+            # Record the computational sampling probability so retained
+            # records can represent the observations not selected.
+            sampled[, inclusion_probability := number / nrow(annual)]
+
+            index <- index + 1L
+            collected[[index]] <- sampled
+        }
+    }
+
+    sampled <- data.table::rbindlist(collected, use.names = TRUE)
+
+    # Combine the original survey weight with the subsampling adjustment.
+    sampled[, train_weight := RAW_WEIGHT / inclusion_probability]
+
+    if (any(!valid_weight(sampled$train_weight))) {
+        stop("Invalid inverse-probability training weight")
+    }
+
+    # Remove the temporary grouping field; retain sampling metadata.
+    sampled[, sampling_group := NULL]
+
+    sampled
+}
+
+
+# -----------------------------------------------------------------------------
+# Design-matrix construction
+# -----------------------------------------------------------------------------
+
+# Build a sparse predictor matrix using the shared feature list.
+# Consistent factor levels help keep the encoding aligned across data subsets.
+matrix_inputs <- function(data) {
+    formula <- stats::reformulate(feature_names)
+
+    matrix <- Matrix::sparse.model.matrix(
+        formula,
+        data = as.data.frame(data)
+    )
+
+    # Remove the formula-generated intercept column.
+    # glmnet handles its own intercept by default.
+    matrix[, colnames(matrix) != "(Intercept)", drop = FALSE]
+}
+
+
+# -----------------------------------------------------------------------------
+# Classifier fitting
+# -----------------------------------------------------------------------------
+
+# Fit one supported classifier using the supplied training records.
+# "parameter" represents lambda for lasso or mtry for the random forest.
+# It is unused for ordinary logistic regression.
+fit_classifier <- function(family, training, parameter = NA_real_) {
+    training <- as.data.frame(training)
+    weights <- normalize_weights(training$train_weight)
+
+    if (family == "logistic") {
+        # Store weights in the model data so formula evaluation can find them.
+        training$.model_weight <- weights
+
+        formula <- stats::reformulate(
+            feature_names,
+            response = "FMD"
+        )
+
+        # Warnings are suppressed in the existing workflow.
+        # Convergence is checked explicitly after fitting.
+        model <- suppressWarnings(
+            stats::glm(
+                formula,
+                data = training,
+                family = stats::binomial(),
+                weights = .model_weight,
+                control = stats::glm.control(maxit = 60)
+            )
+        )
+
+        if (!isTRUE(model$converged)) {
+            stop("Weighted logistic regression did not converge")
+        }
+
+        return(list(
+            family = family,
+            model = model
+        ))
+    }
+
+    if (family == "lasso") {
+        # Fit penalized logistic regression at the supplied penalty value.
+        # alpha = 1 selects the lasso penalty.
+        model <- glmnet::glmnet(
+            x = matrix_inputs(training),
+            y = training$FMD,
+            family = "binomial",
+            alpha = 1,
+            lambda = as.numeric(parameter),
+            weights = weights,
+            standardize = TRUE,
+            maxit = 100000
+        )
+
+        return(list(
+            family = family,
+            model = model,
+            lambda = as.numeric(parameter)
+        ))
+    }
+
+    if (family == "forest") {
+        # Supply only the configured predictors and labeled outcome.
+        forest_data <- training[
+            ,
+            c(feature_names, "outcome_factor"),
+            drop = FALSE
+        ]
+
+        formula <- stats::reformulate(
+            feature_names,
+            response = "outcome_factor"
+        )
+
+        # Fit a probability forest and retain permutation importance.
+        # Bound mtry by the number of available predictors.
+        model <- ranger::ranger(
+            formula,
+            data = forest_data,
+            probability = TRUE,
+            case.weights = weights,
+            num.trees = forest_trees,
+            mtry = min(as.integer(parameter), length(feature_names)),
+            min.node.size = 40,
+            importance = "permutation",
+            num.threads = rf_threads,
+            seed = seed
+        )
+
+        return(list(
+            family = family,
+            model = model,
+            mtry = as.integer(parameter)
+        ))
+    }
+
+    stop("Unsupported model family: ", family)
+}
+
+
+# -----------------------------------------------------------------------------
+# Probability prediction
+# -----------------------------------------------------------------------------
+
+# Provide one prediction interface across the supported model families.
+# Each branch returns the estimated probability of the positive outcome.
+predict_classifier <- function(fitted, data) {
+    data <- as.data.frame(data)
+
+    if (fitted$family == "logistic") {
+        # glm drops factor levels absent from its training years, so predict()
+        # fails when a later year first contains one (e.g. SEX_CLEAN "Missing").
+        # Build the design matrix from the full factor schema instead; a level
+        # the model never saw has no coefficient and contributes zero, as in the
+        # lasso fit. Identical to predict.glm whenever every level was seen.
+        coefficients <- stats::coef(fitted$model)
+        coefficients[is.na(coefficients)] <- 0
+        design <- stats::model.matrix(
+            stats::reformulate(feature_names),
+            data = data
+        )
+        stopifnot(all(names(coefficients) %in% colnames(design)))
+        prediction <- as.numeric(
+            stats::plogis(
+                design[, names(coefficients), drop = FALSE] %*% coefficients
+            )
+        )
+    } else if (fitted$family == "lasso") {
+        prediction <- as.numeric(
+            stats::predict(
+                fitted$model,
+                newx = matrix_inputs(data),
+                s = fitted$lambda,
+                type = "response"
+            )
+        )
+    } else if (fitted$family == "forest") {
+        prediction <- predict(
+            fitted$model,
+            data = data[, feature_names, drop = FALSE],
+            num.threads = rf_threads
+        )$predictions[, "Yes"]
+    } else {
+        stop("Cannot predict with unknown model family")
+    }
+
+    # Require one finite prediction per input record.
+    if (
+        length(prediction) != nrow(data) ||
+        any(!is.finite(prediction))
+    ) {
+        stop("Model predictions have invalid size or probabilities")
+    }
+
+    # Return a numeric vector bounded to the probability interval.
+    pmin(1, pmax(0, as.numeric(prediction)))
+}
+
+
+# -----------------------------------------------------------------------------
+# Weighted discrimination: area under the ROC curve
+# -----------------------------------------------------------------------------
+
+# Calculate AUC from weighted positive-negative comparisons.
+# Equal prediction scores receive half credit.
+weighted_auc <- function(y, p, w) {
+    valid <- valid_outcome(y) & is.finite(p) & valid_weight(w)
+
+    y <- y[valid]
+    p <- p[valid]
+    w <- w[valid]
+
+    # Discrimination is undefined when either outcome class is absent.
+    if (!any(y == 0) || !any(y == 1)) {
+        return(NA_real_)
+    }
+
+    ranked <- data.table::data.table(
+        score = p,
+        positive = w * (y == 1),
+        negative = w * (y == 0)
+    )
+
+    # Aggregate tied scores before accumulating negative-class weight.
+    ranked <- ranked[
+        ,
+        .(
+            pos = sum(positive),
+            neg = sum(negative)
+        ),
+        by = score
+    ][order(score)]
+
+    negative_below <- c(
+        0,
+        head(cumsum(ranked$neg), -1)
+    )
+
+    # Count lower-scoring negatives plus half of tied negative weight.
+    sum(ranked$pos * (negative_below + 0.5 * ranked$neg)) /
+        (sum(ranked$pos) * sum(ranked$neg))
+}
+
+
+# -----------------------------------------------------------------------------
+# Weighted performance summary
+# -----------------------------------------------------------------------------
+
+# Summarize valid outcomes, probabilities, and survey weights.
+# Invalid records are excluded from every metric in this summary.
+weighted_metrics <- function(y, p, w) {
+    valid <- (
+        valid_outcome(y) &
+        is.finite(p) &
+        p >= 0 &
+        p <= 1 &
+        valid_weight(w)
+    )
+
+    y <- y[valid]
+    p <- p[valid]
+    w <- w[valid]
+
+    if (!length(y)) {
+        stop("No valid classified records for metric calculation")
+    }
+
+    observed <- weighted_mean(y, w)
+    predicted <- weighted_mean(p, w)
+
+    data.frame(
+        # Unweighted number of records contributing to the metrics.
+        n = length(y),
+
+        # Weight-based effective sample size; not a full survey-design ESS.
+        effective_n = sum(w)^2 / sum(w^2),
+
+        # Compare weighted outcome prevalence with mean predicted probability.
+        prevalence = observed,
+        mean_prediction = predicted,
+
+        # Positive values indicate average overprediction.
+        # This is a signed mean difference, not a full calibration assessment.
+        calibration_error = predicted - observed,
+
+        # Summarize discrimination and squared probability error.
+        auc = weighted_auc(y, p, w),
+        brier = weighted_mean((y - p)^2, w)
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# Weighted ROC-curve coordinates
+# -----------------------------------------------------------------------------
+
+# Build ROC coordinates by lowering the threshold through distinct scores.
+# Reduce the returned points for display after calculating the cumulative curve.
+weighted_roc <- function(y, p, w, display_points = 300L) {
+    valid <- valid_outcome(y) & is.finite(p) & valid_weight(w)
+
+    ranked <- data.table::data.table(
+        score = p[valid],
+        positive = w[valid] * (y[valid] == 1),
+        negative = w[valid] * (y[valid] == 0)
+    )
+
+    # Process tied scores together, starting with the highest predictions.
+    ranked <- ranked[
+        ,
+        .(
+            pos = sum(positive),
+            neg = sum(negative)
+        ),
+        by = score
+    ][order(-score)]
+
+    # Both outcome classes are required to define the ROC curve.
+    if (!sum(ranked$pos) || !sum(ranked$neg)) {
+        return(data.frame(
+            fpr = NA_real_,
+            tpr = NA_real_
+        ))
+    }
+
+    # Include the initial point where no records are classified as positive.
+    fpr <- c(0, cumsum(ranked$neg) / sum(ranked$neg))
+    tpr <- c(0, cumsum(ranked$pos) / sum(ranked$pos))
+
+    # Select approximately evenly spaced positions along the coordinate list.
+    indices <- unique(
+        as.integer(
+            round(
+                seq(
+                    1,
+                    length(fpr),
+                    length.out = min(display_points, length(fpr))
+                )
+            )
+        )
+    )
+
+    data.frame(
+        fpr = fpr[indices],
+        tpr = tpr[indices]
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# Probability recalibration
+# -----------------------------------------------------------------------------
+
+# Apply an already-estimated calibration intercept and slope.
+# This function transforms predictions; it does not estimate the parameters.
+calibrate_probabilities <- function(p, intercept, slope) {
+    # Clip exact zero and one before converting probabilities to log-odds.
+    linear_score <- stats::qlogis(
+        pmin(1 - 1e-6, pmax(1e-6, p))
+    )
+
+    # Adjust the log-odds, then convert back to probabilities.
+    stats::plogis(intercept + slope * linear_score)
+}
+```

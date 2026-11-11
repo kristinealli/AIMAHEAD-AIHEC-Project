@@ -1,0 +1,598 @@
+---
+title: "05c — Deeper 2023 probability-model diagnostics"
+output: html_notebook
+---
+
+## Purpose and interpretation
+
+This notebook extends the existing `05_Select_Model_2023.Rmd` without changing model fitting, hyperparameters, or the frozen family selection. It **reuses the three fitted models and 2023 selection checkpoint from the active run**. It does not open 2024 or 2025 data.
+
+The 2023 observations served as the **model-selection fold**. Therefore, figures and inferential intervals here describe 2023 selection-fold behavior; they are **not independent validation of the selected winner**. Paired survey-design intervals describe uncertainty in the observed 2023 evaluation sample, conditional on fixed trained model predictions and the historical prevalence baseline. They do not include uncertainty in model training, hyperparameter selection, or winning-family selection.
+
+**Outputs:** a paired Brier improvement table, calibration-in-the-large table, exploratory paired model-comparison table, decile-level calibration table, and three figures. The notebook uses distinct `05c_` names so it does not overwrite Section 05 exploratory results.
+
+## Interpretation
+- **Brier improvement:** Positive paired gains indicate better weighted mean squared probability error than a fixed historical-prevalence prediction.
+- **Model differences:** A lower score for logistic does not prove a material or statistically secure advantage, especially because this same 2023 fold determined the winner. Keep the locked 2024/2025 evaluations for independent confirmation.
+- **Systematic underprediction:** The overall predicted-minus-observed gap shows calibration-in-the-large, not whether all risk levels are equally miscalibrated.
+- **Risk calibration:** Use the reliability curve to see whether errors are concentrated in low-, intermediate-, or high-risk groups. Decile curves are descriptive and their CIs omit uncertainty in model estimation and chosen bin boundaries.
+- **Survey design:** The CIs depend on verified mappings of `PSU`, `STRAT`, and `RAW_WEIGHT`, and the project's documented singleton-PSU treatment. The processed 2023 geographic exclusions and nonresponse may also limit population inference.
+- **Race-related fairness:** Do not use this 2023 section to choose a model based on AI/AN subgroup results. Leave subgroup evaluation to the preplanned final notebooks.
+
+## Setup
+
+```{r setup}
+# Locate the project and load its shared R Notebook helpers.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+check_packages(c("survey", "data.table", "ggplot2"))
+run_context <- attach_run()
+cat("[RUN] Active increment:", run_context$id, "\n")
+
+# Document the adopted design settings before interpreting intervals.
+# The mapping of STRAT / PSU / RAW_WEIGHT to original CDC fields
+# must have been verified in the project's survey-design audit.
+old_survey_options <- options(
+    survey.lonely.psu = "adjust",
+    survey.adjust.domain.lonely = TRUE
+)
+```
+
+## Reconstruct fixed 2023 predictions (no retraining)
+
+```{r reconstruct-2023-predictions}
+selection <- as.data.frame(load_run_rds("checkpoints", "02_selection_2023"))
+frozen <- load_run_rds("models", "05_frozen_selection")
+families <- c("logistic", "lasso", "forest")
+
+stopifnot(
+    identical(as.integer(unique(selection$YEAR)), as.integer(selection_year)),
+    all(selection$FMD %in% c(0, 1)),
+    all(is.finite(selection$RAW_WEIGHT) & selection$RAW_WEIGHT > 0),
+    all(!is.na(selection$STRAT)),
+    all(!is.na(selection$PSU)),
+    length(frozen$training_prevalence) == 1L,
+    is.finite(frozen$training_prevalence),
+    frozen$training_prevalence > 0,
+    frozen$training_prevalence < 1
+)
+
+# Confirm that the saved model-selection artifacts are present for this run.
+existing_results <- data.table::fread(
+    artifact_path("tables", "05_2023_model_selection", "csv")
+)
+existing_baseline <- data.table::fread(
+    artifact_path("tables", "05_2023_baseline", "csv")
+)
+
+# Use the original selection respondents and the same frozen candidates.
+# No refitting and no parameter changes occur here.
+predictions <- lapply(families, function(family) {
+    fitted <- load_run_rds("models", paste0("05_", family))
+    predict_classifier(fitted, selection)
+})
+names(predictions) <- families
+
+# Store record-level outcomes, probabilities, and squared errors.
+record_data <- data.table::data.table(
+    FMD = selection$FMD,
+    RAW_WEIGHT = selection$RAW_WEIGHT,
+    STRAT = selection$STRAT,
+    PSU = selection$PSU
+)
+
+record_data[, p_prevalence_only := rep(
+    frozen$training_prevalence,
+    .N
+)]
+
+for (family in families) {
+    record_data[, (paste0("p_", family)) := predictions[[family]]]
+}
+
+for (family in c(families, "prevalence_only")) {
+    probability <- record_data[[paste0("p_", family)]]
+    record_data[, (paste0("loss_", family)) :=
+        (FMD - probability)^2]
+    record_data[, (paste0("cal_error_", family)) :=
+        probability - FMD]
+}
+
+# The paired Brier improvements compare the *same people* under
+# different fixed prediction methods. Positive means improvement.
+for (family in families) {
+    record_data[, (paste0("gain_", family)) :=
+        loss_prevalence_only - get(paste0("loss_", family))]
+}
+
+record_data[, better_logistic_than_lasso := loss_lasso - loss_logistic]
+record_data[, better_logistic_than_forest := loss_forest - loss_logistic]
+
+# Check that reconstructed metrics reproduce the saved results.
+for (family in families) {
+    calculated <- weighted_metrics(
+        record_data$FMD,
+        record_data[[paste0("p_", family)]],
+        record_data$RAW_WEIGHT
+    )
+    matching_rows <- which(
+        existing_results[["family"]] == family
+    )
+
+    previously_saved <- existing_results[matching_rows, ]
+        stopifnot(
+            nrow(previously_saved) == 1L,
+            abs(calculated$brier - previously_saved$brier) < 1e-8,
+            abs(calculated$mean_prediction - previously_saved$mean_prediction) < 1e-8
+        )
+}
+
+calculated_baseline <- weighted_metrics(
+    record_data$FMD,
+    record_data$p_prevalence_only,
+    record_data$RAW_WEIGHT
+)
+stopifnot(
+    abs(calculated_baseline$brier - existing_baseline$brier[1]) < 1e-8
+)
+
+cat("[CHECK] Saved 2023 scores reproduced without retraining.\n")
+```
+
+## Paired survey-design comparisons
+
+The sampling-unit and stratum columns are used as stored in the processed checkpoint. With the recorded design mapping, the survey methods account for paired outcomes when estimating the uncertainty of Brier-score differences. This differs from an **unpaired** comparison of two independently estimated model scores.
+
+```{r paired-survey-results}
+# The underlying audit indicated PSU IDs are effectively unique
+# within 2023 strata, but use the actual retained PSU identifiers.
+# If the source-variable mapping is not verified, treat the CIs
+# as provisional and do not make definitive population claims.
+design_2023 <- survey::svydesign(
+    ids = ~PSU,
+    strata = ~STRAT,
+    weights = ~RAW_WEIGHT,
+    nest = TRUE,
+    data = record_data
+)
+
+# A reusable helper for paired design-based point estimates and CIs.
+get_survey_estimates <- function(variables, design) {
+    formula <- stats::reformulate(variables)
+    estimate <- survey::svymean(formula, design, na.rm = FALSE)
+    interval <- stats::confint(estimate)
+    data.table::data.table(
+        measure = names(stats::coef(estimate)),
+        estimate = as.numeric(stats::coef(estimate)),
+        standard_error = as.numeric(survey::SE(estimate)),
+        ci_l = as.numeric(interval[, 1]),
+        ci_u = as.numeric(interval[, 2])
+    )
+}
+
+baseline_brier <- calculated_baseline$brier
+
+brier_improvements <- get_survey_estimates(
+    paste0("gain_", families),
+    design_2023
+)
+brier_improvements[, family := sub("^gain_", "", measure)]
+brier_improvements[, relative_skill_pct := 100 * estimate / baseline_brier]
+# Relative skill is descriptive. Inferential intervals below are
+# for the absolute paired improvement, not the relative ratio.
+
+calibration_errors <- get_survey_estimates(
+    paste0("cal_error_", c(families, "prevalence_only")),
+    design_2023
+)
+calibration_errors[, family := sub("^cal_error_", "", measure)]
+for (column in c("estimate", "standard_error", "ci_l", "ci_u")) {
+    data.table::set(
+        calibration_errors,
+        j = paste0(column, "_pp"),
+        value = 100 * calibration_errors[[column]]
+    )
+}
+
+# Very small differences between model families are exploratory.
+# The 2023 fold already selected the winner, so these comparisons
+# cannot establish an unbiased winner advantage.
+model_comparisons <- get_survey_estimates(
+    c("better_logistic_than_lasso", "better_logistic_than_forest"),
+    design_2023
+)
+
+save_table(brier_improvements, "05c_2023_paired_brier_gain")
+save_table(calibration_errors, "05c_2023_calibration_in_large")
+save_table(model_comparisons, "05c_2023_paired_model_differences")
+
+cat("\n[2023] Paired Brier gains over prevalence-only baseline\n")
+print(brier_improvements)
+cat("\n[2023] Overall calibration errors (predicted minus observed, pp)\n")
+print(calibration_errors)
+cat("\n[2023] Exploratory model-to-model paired Brier differences\n")
+print(model_comparisons)
+```
+
+## Figure A — Improvement over the historical-prevalence baseline
+
+```{r plot-brier-gain}
+figure_a <- data.table::copy(brier_improvements)
+figure_a[, family := factor(family, levels = c("forest", "lasso", "logistic"))]
+figure_a[, skill_label := sprintf("%.2f%% lower Brier", relative_skill_pct)]
+
+plot_brier_gain <- ggplot2::ggplot(
+    figure_a,
+    ggplot2::aes(x = estimate, y = family, color = family)
+) +
+    ggplot2::geom_vline(
+        xintercept = 0, linetype = "dashed",
+        color = atg_palette[["mauve"]]
+    ) +
+    ggplot2::geom_errorbarh(
+        ggplot2::aes(xmin = ci_l, xmax = ci_u),
+        height = 0.16, linewidth = 0.85
+    ) +
+    ggplot2::geom_point(size = 3.6) +
+    ggplot2::geom_text(
+        ggplot2::aes(label = skill_label),
+        nudge_y = 0.19, size = 3.8, show.legend = FALSE
+    ) +
+    atg_scale_color_models() +
+    atg_theme() +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::scale_x_continuous(
+        labels = function(values) sprintf("%.3f", values),
+        expand = ggplot2::expansion(mult = c(0.07, 0.15))
+    ) +
+    ggplot2::labs(
+        title = "How much better are the models than prevalence alone?",
+        subtitle = "2023 selection fold; positive Brier-score gain is better",
+        x = "Reduction in Brier score (baseline minus model)",
+        y = NULL,
+        caption = paste(
+            "Points: paired survey-weighted gains; whiskers: approximate 95% survey-design CIs.",
+            "Percentage labels: descriptive reduction relative to the observed baseline.",
+            "Training/selection uncertainty is not included."
+        )
+    )
+
+show_and_save(plot_brier_gain, "05c_2023_paired_brier_gain", 10, 5.2)
+```
+
+## Figure B — Systematic underprediction
+
+The calibration error is the **survey-weighted mean predicted risk minus observed FMD prevalence**. Zero indicates perfect calibration-in-the-large; negative values indicate underprediction. This alone does not establish the calibration slope or calibration of individual risk estimates.
+
+```{r plot-calibration-in-large}
+figure_b <- data.table::copy(calibration_errors)
+figure_b[, family := factor(
+    family,
+    levels = c("prevalence_only", "forest", "lasso", "logistic")
+)]
+
+plot_calibration_error <- ggplot2::ggplot(
+    figure_b,
+    ggplot2::aes(x = estimate_pp, y = family, color = family)
+) +
+    ggplot2::geom_vline(
+        xintercept = 0, linetype = "dashed",
+        color = atg_palette[["mauve"]]
+    ) +
+    ggplot2::geom_errorbarh(
+        ggplot2::aes(xmin = ci_l_pp, xmax = ci_u_pp),
+        height = 0.16, linewidth = 0.85
+    ) +
+    ggplot2::geom_point(size = 3.6) +
+    atg_scale_color_models() +
+    atg_theme() +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::scale_x_continuous(
+        labels = function(values) sprintf("%+.1f pp", values),
+        expand = ggplot2::expansion(mult = c(0.12, 0.2))
+    ) +
+    ggplot2::labs(
+        title = "How far below the actual 2023 prevalence do predictions fall?",
+        subtitle = sprintf(
+            "Observed survey-weighted FMD prevalence: %.2f%%",
+            100 * calculated_baseline$prevalence
+        ),
+        x = "Mean predicted prevalence minus observed prevalence",
+        y = NULL,
+        caption = paste(
+            "Negative values indicate underprediction.",
+            "Whiskers are approximate 95% survey-design CIs conditional on fixed models.",
+            "This is calibration-in-the-large, not a full calibration curve."
+        )
+    )
+
+show_and_save(plot_calibration_error, "05c_2023_calibration_error", 10, 5.2)
+```
+
+## Figure C — Reliability across predicted risk groups
+
+This calibration curve uses the family already frozen by Section 05. Risk-group boundaries are defined by **weighted quantiles of predicted probabilities in the 2023 selection fold**, with ties kept together. Survey weights are used for prevalence and prediction means. The error bars reflect sampling uncertainty in **observed** outcomes only; they do not capture model-estimation or group-boundary uncertainty.
+
+```{r plot-risk-calibration}
+chosen_family <- frozen$chosen_family
+stopifnot(chosen_family %in% families)
+record_data[, p_chosen := get(paste0("p_", chosen_family))]
+
+# Weighted quantiles preserve risk-score ties: identical scores
+# are never split across risk groups just to create 10 bins.
+weighted_quantiles <- function(x, w, probabilities) {
+    ordered <- order(x)
+    ordered_values <- x[ordered]
+    cumulative <- cumsum(w[ordered]) / sum(w)
+    vapply(probabilities, function(probability) {
+        ordered_values[which(cumulative >= probability)[1]]
+    }, numeric(1))
+}
+
+risk_breaks <- unique(c(
+    -Inf,
+    weighted_quantiles(
+        record_data$p_chosen,
+        record_data$RAW_WEIGHT,
+        seq(0.1, 0.9, by = 0.1)
+    ),
+    Inf
+))
+
+if (length(risk_breaks) < 4L) {
+    stop("Too few distinct prediction values to create risk groups")
+}
+
+record_data[, risk_bin := cut(
+    p_chosen,
+    breaks = risk_breaks,
+    include.lowest = TRUE,
+    labels = FALSE
+)]
+
+# ------------------------------------------------------------
+# Diagnose singleton PSUs in the 2023 calibration sample
+# ------------------------------------------------------------
+
+# Count distinct PSUs within each stratum.
+full_strata <- record_data[
+    ,
+    .(
+        respondents = .N,
+        n_psus = data.table::uniqueN(PSU)
+    ),
+    by = STRAT
+]
+
+cat(
+    "\nSingleton strata in the full 2023 analysis sample:",
+    sum(full_strata$n_psus == 1L),
+    "\n"
+)
+
+# Count singleton strata within predicted-risk groups.
+risk_strata <- record_data[
+    ,
+    .(
+        respondents = .N,
+        n_psus = data.table::uniqueN(PSU)
+    ),
+    by = .(risk_bin, STRAT)
+]
+
+risk_summary <- risk_strata[
+    ,
+    .(
+        strata_represented = .N,
+        singleton_strata = sum(n_psus == 1L)
+    ),
+    by = risk_bin
+][order(risk_bin)]
+
+print(risk_summary)
+
+# Rebuild the survey design because risk_bin and p_chosen
+# were added after creating the original design object.
+calibration_design <- survey::svydesign(
+    ids = ~PSU,
+    strata = ~STRAT,
+    weights = ~RAW_WEIGHT,
+    nest = TRUE,
+    data = record_data
+)
+
+
+# ------------------------------------------------------------
+# Calculate calibration using the full survey design
+# ------------------------------------------------------------
+
+# Estimate observed FMD prevalence for all risk groups
+# simultaneously, retaining the full survey structure.
+#
+# A no-intercept survey-weighted Gaussian regression with
+# one factor per risk group estimates the weighted mean
+# outcome within each group.
+#
+# Design-based standard errors are calculated from the
+# full survey design rather than separate subset designs.
+
+bin_ids <- sort(unique(record_data$risk_bin))
+
+# Create a factor with a fixed ordering.
+record_data[
+    ,
+    risk_factor := factor(
+        risk_bin,
+        levels = bin_ids
+    )
+]
+
+# Rebuild the survey design to include the new variable.
+calibration_design <- survey::svydesign(
+    ids = ~PSU,
+    strata = ~STRAT,
+    weights = ~RAW_WEIGHT,
+    nest = TRUE,
+    data = record_data
+)
+
+# Calculate observed FMD prevalence in each risk group.
+# Gaussian identity-link regression is used to estimate
+# group means; survey supplies the design-based variance.
+
+observed_fit <- survey::svyglm(
+    FMD ~ 0 + risk_factor,
+    design = calibration_design,
+    family = stats::gaussian()
+)
+
+# Extract estimates and 95% confidence intervals.
+observed_estimates <- stats::coef(observed_fit)
+observed_intervals <- stats::confint(observed_fit)
+
+# Identify the coefficients for each risk group.
+term_names <- paste0("risk_factor", bin_ids)
+
+stopifnot(
+    all(term_names %in% names(observed_estimates)),
+    all(term_names %in% rownames(observed_intervals))
+)
+
+observed_table <- data.table::data.table(
+    risk_bin = as.integer(bin_ids),
+    observed = as.numeric(
+        observed_estimates[term_names]
+    ),
+    observed_ci_l = as.numeric(
+        observed_intervals[term_names, 1]
+    ),
+    observed_ci_u = as.numeric(
+        observed_intervals[term_names, 2]
+    )
+)
+
+# Calculate the survey-weighted mean predicted probability
+# for each risk group.
+predicted_table <- record_data[
+    ,
+    .(
+        respondents = .N,
+        predicted = stats::weighted.mean(
+            p_chosen,
+            RAW_WEIGHT
+        )
+    ),
+    by = risk_bin
+]
+
+# Combine predicted and observed estimates.
+calibration_table <- merge(
+    predicted_table,
+    observed_table,
+    by = "risk_bin",
+    sort = TRUE
+)
+
+# Preserve the original column order.
+data.table::setcolorder(
+    calibration_table,
+    c(
+        "risk_bin",
+        "respondents",
+        "predicted",
+        "observed",
+        "observed_ci_l",
+        "observed_ci_u"
+    )
+)
+
+# Save the calibration results.
+save_table(
+    calibration_table,
+    "05c_2023_calibration_by_risk"
+)
+
+print(calibration_table)
+
+data.table::setorder(calibration_table, predicted)
+plot_calibration <- ggplot2::ggplot(
+    calibration_table,
+    ggplot2::aes(x = predicted, y = observed)
+) +
+    ggplot2::geom_abline(
+        intercept = 0,
+        slope = 1,
+        linetype = "dashed",
+        color = atg_palette[["mauve"]]
+    ) +
+    ggplot2::geom_errorbar(
+        ggplot2::aes(ymin = observed_ci_l, ymax = observed_ci_u),
+        width = 0,
+        linewidth = 0.7,
+        color = atg_palette[["evergreen"]]
+    ) +
+    ggplot2::geom_line(
+        color = atg_palette[["evergreen"]],
+        linewidth = 1
+    ) +
+    ggplot2::geom_point(
+        color = atg_palette[["evergreen"]],
+        size = 3
+    ) +
+    ggplot2::coord_equal() +
+    ggplot2::scale_x_continuous(
+        labels = scales::percent_format(accuracy = 1)
+    ) +
+    ggplot2::scale_y_continuous(
+        labels = scales::percent_format(accuracy = 1)
+    ) +
+    atg_theme() +
+    ggplot2::labs(
+        title = paste("2023 risk calibration:", chosen_family),
+        subtitle = "Survey-weighted observed versus predicted FMD across risk groups",
+        x = "Average predicted FMD probability",
+        y = "Observed frequent mental distress prevalence",
+        caption = paste(
+            "Dashed line: perfect calibration. Points represent weighted risk groups;",
+            "whiskers are approximate survey-design CIs for observed prevalence.",
+            "2023 was used to select the model, not for independent testing."
+        )
+    )
+
+show_and_save(plot_calibration, "05c_2023_risk_calibration", 8.5, 7)
+```

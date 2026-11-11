@@ -1,0 +1,38 @@
+# RStudio, R, and local session files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+Rplots.pdf
+
+# Rendered notebooks, generated reports, and temporary archives
+*.nb.html
+*.html
+*.zip
+
+# Keep only the documented primary processed inputs. Ignore derived analysis
+# datasets, metadata sidecars, and exploratory subsets.
+data/
+!data/
+data/*
+!data/processed/
+data/processed/*
+!data/processed/README.md
+!data/processed/analysis_pooled_2014_2024.rds
+!data/processed/full_slim_2025.rds
+
+# Generated analysis outputs, rendered notebooks, models, and archives
+outputs/
+*.rds
+*.pt
+*.h5
+*.pkl
+
+# Local run notes
+docs/RUN_0001_REVIEW_AND_IMPROVEMENTS.md
+docs/RUN_AND_VALIDATION.md
+
+# Required processed source inputs
+!data/processed/analysis_pooled_2014_2024.rds
+!data/processed/full_slim_2025.rds

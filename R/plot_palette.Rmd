@@ -1,0 +1,187 @@
+---
+title: "Shared FMD Project color palette"
+output: html_notebook
+---
+
+**Purpose:** use the same nine colors across every chart. AI/AN-alone and other
+single-race respondents always use the same two contrasting colors; other
+colors are reserved for models, risk categories, and visual emphasis.
+
+This module changes **presentation only**, never survey data, model fitting,
+probabilities, group definitions, or performance metrics. The custom scales
+are applied explicitly in each notebook to prevent inconsistent automatic
+colors when one group or category is absent.
+
+## Palette, scales, and chart theme
+
+```{r shared-plot-palette}
+# Use the exact nine supplied colors with descriptive, reusable names.
+atg_palette <- c(
+    rose = "#c98389",
+    burgundy = "#954e4b",
+    peach = "#febd97",
+    sand = "#d6c6bc",
+    gold = "#c3a052",
+    mauve = "#82667a",
+    turquoise = "#33c2b1",
+    evergreen = "#125238",
+    rust = "#aa663c"
+)
+
+# Use the requested turquoise, rust, and gold colors for the main populations.
+atg_group_colors <- c(
+    "AI/AN alone" = atg_palette[["turquoise"]],
+    "Other identified single-race" = atg_palette[["rust"]],
+    "Unresolved/multiracial" = atg_palette[["gold"]]
+)
+
+# Keep algorithm colors fixed across year and evaluation notebooks.
+atg_model_colors <- c(
+    logistic = atg_palette[["rust"]],
+    lasso = atg_palette[["turquoise"]],
+    forest = atg_palette[["gold"]],
+    prevalence_only = atg_palette[["evergreen"]]
+)
+
+# Feature names match the actual harmonized predictors, not causal constructs.
+atg_feature_colors <- c(
+    physical_days_group = atg_palette[["turquoise"]],
+    general_health_group = atg_palette[["rust"]],
+    AGE_BAND = atg_palette[["gold"]],
+    SEX_CLEAN = atg_palette[["rose"]],
+    EDU_CLEAN = atg_palette[["turquoise"]],
+    INCOME_BAND = atg_palette[["gold"]]
+)
+
+atg_predictor_group_colors <- c(
+    physical_only = atg_palette[["turquoise"]],
+    social_demographic_only = atg_palette[["gold"]],
+    combined = atg_palette[["rust"]],
+    historical_average = atg_palette[["evergreen"]]
+)
+
+atg_version_colors <- c(
+    raw = atg_palette[["rust"]],
+    calibrated = atg_palette[["turquoise"]]
+)
+
+atg_measure_colors <- c(
+    prevalence = atg_palette[["rust"]],
+    mean_prediction = atg_palette[["gold"]]
+)
+
+atg_year_colors <- c(
+    `2023` = atg_palette[["gold"]],
+    `2025` = atg_palette[["turquoise"]]
+)
+
+# A restrained publication-style theme for readable, accessible charts.
+atg_theme <- function() {
+    ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(
+            plot.title = ggplot2::element_text(
+                color = atg_palette[["rust"]],
+                face = "bold",
+                size = 13
+            ),
+            plot.subtitle = ggplot2::element_text(
+                color = atg_palette[["gold"]],
+                size = 10
+            ),
+            plot.caption = ggplot2::element_text(
+                color = atg_palette[["gold"]],
+                size = 9
+            ),
+            axis.title = ggplot2::element_text(color = atg_palette[["turquoise"]]),
+            axis.text = ggplot2::element_text(color = atg_palette[["rust"]]),
+            legend.title = ggplot2::element_text(face = "bold"),
+            legend.position = "bottom",
+            panel.grid.minor = ggplot2::element_blank(),
+            panel.grid.major = ggplot2::element_line(
+                color = "#e6dfdb",
+                linewidth = 0.3
+            ),
+            plot.background = ggplot2::element_rect(fill = "white", color = NA)
+        )
+}
+
+atg_scale_color_groups <- function() {
+    ggplot2::scale_color_manual(values = atg_group_colors, na.value = atg_palette[["sand"]])
+}
+
+atg_scale_fill_groups <- function() {
+    ggplot2::scale_fill_manual(values = atg_group_colors, na.value = atg_palette[["sand"]])
+}
+
+atg_scale_color_models <- function() {
+    ggplot2::scale_color_manual(values = atg_model_colors)
+}
+
+atg_scale_fill_models <- function() {
+    ggplot2::scale_fill_manual(values = atg_model_colors)
+}
+
+atg_scale_color_features <- function() {
+    ggplot2::scale_color_manual(values = atg_feature_colors)
+}
+
+atg_scale_fill_features <- function() {
+    ggplot2::scale_fill_manual(values = atg_feature_colors)
+}
+
+atg_scale_fill_predictor_groups <- function() {
+    ggplot2::scale_fill_manual(values = atg_predictor_group_colors)
+}
+
+atg_scale_fill_versions <- function() {
+    ggplot2::scale_fill_manual(values = atg_version_colors)
+}
+
+atg_scale_fill_measures <- function() {
+    ggplot2::scale_fill_manual(values = atg_measure_colors)
+}
+
+atg_scale_fill_years <- function() {
+    ggplot2::scale_fill_manual(values = atg_year_colors)
+}
+
+atg_scale_fill_flags <- function() {
+    ggplot2::scale_fill_manual(
+        values = c(`FALSE` = atg_palette[["sand"]], `TRUE` = atg_palette[["turquoise"]]),
+        labels = c(`FALSE` = "Other candidate", `TRUE` = "Selected model")
+    )
+}
+
+# Deterministic category mapping: the literal "Missing" stays sand across charts.
+# Each named BRFSS response category receives a fixed color, independent of order.
+atg_category_colors <- function(values) {
+    labels <- sort(unique(as.character(values)))
+    labels <- labels[!is.na(labels)]
+    fallback <- c(
+        atg_palette[["turquoise"]], atg_palette[["rust"]],
+        atg_palette[["gold"]], atg_palette[["evergreen"]],
+        atg_palette[["rose"]], atg_palette[["peach"]],
+        atg_palette[["burgundy"]], atg_palette[["mauve"]]
+    )
+    colors <- stats::setNames(rep(fallback, length.out = length(labels)), labels)
+    fixed <- c(
+        `0` = atg_palette[["turquoise"]],
+        `1-6` = atg_palette[["turquoise"]],
+        `7-13` = atg_palette[["gold"]],
+        `14-20` = atg_palette[["peach"]],
+        `21-30` = atg_palette[["rust"]],
+        `<25k` = atg_palette[["rust"]],
+        `25-49k` = atg_palette[["rust"]],
+        `50-74k` = atg_palette[["gold"]],
+        `75k+` = atg_palette[["turquoise"]],
+        Missing = atg_palette[["sand"]]
+    )
+    known <- intersect(labels, names(fixed))
+    colors[known] <- fixed[known]
+    colors
+}
+
+atg_scale_fill_categories <- function(values) {
+    ggplot2::scale_fill_manual(values = atg_category_colors(values))
+}
+```

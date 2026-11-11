@@ -1,0 +1,650 @@
+---
+title: "07b — 2025 National Model Diagnostics (Amendment)"
+subtitle: "All eligible 2025 respondents, regardless of race | Frozen models"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+---
+
+# Purpose and analytic boundaries
+
+This is a **visualization-only amendment to Notebook 07**. It reads the saved `07_scored_2025` checkpoint and evaluates the **entire eligible 2025 respondent sample**, irrespective of race, AI/AN status, or whether race was resolved. It uses the **same three pre-existing, historically trained and 2024-calibrated probability predictions**: logistic regression, LASSO, and random forest.
+
+**No model fitting, recalibration, model selection, or threshold tuning occurs here.** This notebook does not change previous project outputs. It creates three **separate ROC figures**, three **separate precision–recall figures**, and three **separate confusion matrices**, plus useful comparative visualizations, metric tables, and audit tables.
+
+- **ROC / AUROC:** Weighted discrimination across all thresholds; no cutoff required.
+- **Precision–recall / weighted average precision (AP):** Performance for the positive class (FMD), particularly useful with unequal class prevalence.
+- **F1, precision, recall, specificity, accuracy, confusion matrices:** Depend on a **pre-specified cutoff of 0.50**. This is a reporting convention, **not a threshold optimized on the 2025 evaluation data**. With an FMD prevalence near 16%, a 0.50 cutoff may be conservative and produce relatively few positive classifications.
+- **Brier score and calibration:** Evaluate prediction probabilities rather than thresholded decisions.
+- **Survey design:** Survey weights (`RAW_WEIGHT`) are used for all primary metrics. Graphs and metrics here do not estimate confidence intervals or incorporate PSU/stratum uncertainty. The notebook's 2025 data have already been examined in prior exploratory work; these are later-year / out-of-time **post-hoc** analyses, not an untouched prospective evaluation.
+
+## 1. Attach to the existing run
+
+```{r setup, include=FALSE}
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) return(current)
+        parent <- dirname(current)
+        if (identical(parent, current)) stop("Open FMD_Project.Rproj in RStudio first.")
+        current <- parent
+    }
+}
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+# Matches the loader used by Notebooks 07 and 08.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    lines <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1L]
+        if (is.na(finish) || finish <= start + 1L) stop("Malformed R chunk: ", path)
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+run_context <- attach_run()  # attaches; does not create a new run
+check_packages(c("data.table", "ggplot2"))
+cat("[07b] Attached run:", run_context$id, "\n")
+```
+
+## 2. Load and audit the complete 2025 scoring checkpoint
+
+```{r load-national-2025, message=FALSE, warning=FALSE}
+scored <- data.table::as.data.table(load_run_rds("checkpoints", "07_scored_2025"))
+needed <- c("YEAR", "FMD", "RAW_WEIGHT", "prob_logistic", "prob_lasso", "prob_forest")
+missing_cols <- setdiff(needed, names(scored))
+if (length(missing_cols)) stop("Missing columns in Notebook 07 checkpoint: ",
+                               paste(missing_cols, collapse = ", "))
+if (!nrow(scored) || anyNA(scored$YEAR) || !all(as.integer(scored$YEAR) == 2025L)) {
+    stop("Expected a nonempty checkpoint containing only 2025 observations.")
+}
+
+# There is deliberately NO race/cohort selection here.
+eligible <- data.table::copy(scored[valid_outcome(FMD) & valid_weight(RAW_WEIGHT)])
+if (!nrow(eligible)) stop("No 2025 respondents have valid FMD outcomes and weights.")
+eligible[, y_binary := as.numeric(as.character(FMD))]
+if (anyNA(eligible$y_binary) || !all(eligible$y_binary %in% c(0, 1))) {
+    stop("FMD must be coded 0/1 for binary classification metrics.")
+}
+if (data.table::uniqueN(eligible$y_binary) != 2L) stop("Both FMD classes must be present.")
+
+families <- c("logistic", "lasso", "forest")
+model_names <- c(logistic = "Logistic regression", lasso = "LASSO", forest = "Random forest")
+model_colors <- c(logistic = "#2D9E98", lasso = "#B66D46", forest = "#C59B50")
+positive_color <- "#B66D46"
+negative_color <- "#2D9E98"
+for (family in families) {
+    p <- eligible[[paste0("prob_", family)]]
+    if (!is.numeric(p) || any(!is.finite(p)) || any(p < 0 | p > 1)) {
+        stop("Invalid 2025 probabilities for ", family, ".")
+    }
+}
+
+n_eligible <- nrow(eligible)
+y <- eligible$y_binary
+w <- eligible$RAW_WEIGHT
+weighted_prevalence <- sum(w * y) / sum(w)
+threshold_fixed <- 0.20 
+
+audit <- data.table::data.table(
+    item = c("2025 scored records", "Eligible known-outcome and positive-weight records",
+             "Excluded from metrics", "Unweighted FMD-positive count",
+             "Unweighted FMD-negative count", "Survey-weighted FMD prevalence",
+             "Fixed classification threshold"),
+    value = c(nrow(scored), n_eligible, nrow(scored) - n_eligible,
+              sum(y == 1), sum(y == 0),
+              sprintf("%.4f (%.2f%%)", weighted_prevalence, 100 * weighted_prevalence),
+              sprintf("%.2f", threshold_fixed))
+)
+print(audit)
+save_table(audit, "07b_national_2025_cohort_audit_20_threshold")
+cat("[07b] Race/cohort columns, if present, were NOT used to restrict eligibility.\n")
+```
+
+## 3. Define reproducible, survey-weighted metrics
+
+**Definitions:** Recall / sensitivity = TP/(TP+FN); specificity = TN/(TN+FP); precision = TP/(TP+FP); F1 = harmonic mean of precision and recall. A displayed confusion matrix is **row-normalized by actual outcome using survey weights** and also reports unweighted respondent counts. Weighted cell totals are weighted population totals, not counts of individual survey participants.
+
+```{r weighted-metric-functions}
+safe_ratio <- function(numerator, denominator, default = 0) {
+    if (!is.finite(denominator) || denominator <= 0) return(default)
+    numerator / denominator
+}
+
+weighted_confusion <- function(y, p, w, threshold = 0.5) {
+    predicted <- as.integer(p >= threshold)
+    tp <- sum(w[y == 1 & predicted == 1]); fn <- sum(w[y == 1 & predicted == 0])
+    fp <- sum(w[y == 0 & predicted == 1]); tn <- sum(w[y == 0 & predicted == 0])
+    n_tp <- sum(y == 1 & predicted == 1); n_fn <- sum(y == 1 & predicted == 0)
+    n_fp <- sum(y == 0 & predicted == 1); n_tn <- sum(y == 0 & predicted == 0)
+    precision <- safe_ratio(tp, tp + fp)
+    recall <- safe_ratio(tp, tp + fn)
+    specificity <- safe_ratio(tn, tn + fp)
+    f1 <- safe_ratio(2 * precision * recall, precision + recall)
+    balanced_accuracy <- (recall + specificity) / 2
+    metrics <- data.table::data.table(
+        threshold = threshold,
+        weighted_accuracy = safe_ratio(tp + tn, tp + tn + fp + fn),
+        weighted_balanced_accuracy = balanced_accuracy,
+        weighted_precision = precision,
+        weighted_recall = recall,
+        weighted_specificity = specificity,
+        weighted_f1 = f1,
+        weighted_false_positive_rate = 1 - specificity,
+        weighted_predicted_positive_fraction = safe_ratio(tp + fp, tp + fn + fp + tn)
+    )
+    cells <- data.table::data.table(
+        actual = c("No FMD", "No FMD", "FMD", "FMD"),
+        predicted = c("No FMD", "FMD", "No FMD", "FMD"),
+        cell = c("TN", "FP", "FN", "TP"),
+        n_respondents = c(n_tn, n_fp, n_fn, n_tp),
+        weighted_total = c(tn, fp, fn, tp),
+        weighted_row_percent = 100 * c(
+            safe_ratio(tn, tn + fp), safe_ratio(fp, tn + fp),
+            safe_ratio(fn, fn + tp), safe_ratio(tp, fn + tp))
+    )
+    list(metrics = metrics, cells = cells)
+}
+
+# Compute weighted ROC and weighted precision-recall coordinates at each
+# DISTINCT prediction threshold.  Equal scores are handled together; this
+# avoids an arbitrary ordering of tied scores.
+weighted_binary_curves <- function(y, p, w) {
+    data <- data.table::data.table(score = p, y = as.integer(y), w = w)
+    pts <- data[, .(positive_w = sum(w[y == 1L]),
+                    negative_w = sum(w[y == 0L])), by = score]
+    data.table::setorder(pts, -score)
+    Wpos <- sum(w[y == 1L]); Wneg <- sum(w[y == 0L])
+    pts[, tp_w := cumsum(positive_w)]
+    pts[, fp_w := cumsum(negative_w)]
+    pts[, tn_w := Wneg - fp_w]
+    pts[, fn_w := Wpos - tp_w]
+    pts[, tpr := tp_w / Wpos]
+    pts[, fpr := fp_w / Wneg]
+    pts[, recall := tpr]
+    pts[, precision := tp_w / pmax(tp_w + fp_w, .Machine$double.eps)]
+    pts[, f1 := 2 * precision * recall / pmax(precision + recall, .Machine$double.eps)]
+    pts[, threshold := score]
+    origin <- data.table::data.table(
+        score = Inf, positive_w = 0, negative_w = 0,
+        tp_w = 0, fp_w = 0, tn_w = Wneg, fn_w = Wpos,
+        tpr = 0, fpr = 0, recall = 0, precision = 1, f1 = 0,
+        threshold = Inf
+    )
+    pts <- data.table::rbindlist(list(origin, pts), use.names = TRUE)
+    pts[, tpr := pmin(1, pmax(0, tpr))]
+    pts[, fpr := pmin(1, pmax(0, fpr))]
+    pts[, recall := pmin(1, pmax(0, recall))]
+    pts[, precision := pmin(1, pmax(0, precision))]
+    n <- nrow(pts)
+    auc_trapezoid <- sum(diff(pts$fpr) * (pts$tpr[-1] + pts$tpr[-n]) / 2)
+    # Weighted average precision: stepwise precision-recall integration.
+    ap <- sum(pmax(0, diff(pts$recall)) * pts$precision[-1])
+    list(points = pts, auc_from_curve = auc_trapezoid, average_precision = ap)
+}
+
+# For plotting only. Full, unthinned predictions are used in all metrics.
+thin_points <- function(points, max_points = 2200L) {
+    n <- nrow(points)
+    if (n <= max_points) return(points)
+    keep <- unique(c(seq_len(min(n, 80L)),
+                     as.integer(round(seq(1, n, length.out = max_points))), n))
+    points[sort(keep)]
+}
+
+weighted_logloss <- function(y, p, w) {
+    eps <- 1e-12
+    p <- pmin(1 - eps, pmax(eps, p))
+    sum(w * (-y * log(p) - (1 - y) * log1p(-p))) / sum(w)
+}
+```
+
+## 4. Compute model-level results using **all** eligible respondents
+
+```{r compute-national-metrics, message=FALSE, warning=FALSE}
+all_curves <- list()
+metrics <- list()
+threshold_metrics <- list()
+confusion_cells <- list()
+
+for (family in families) {
+    p <- eligible[[paste0("prob_", family)]]
+    curve <- weighted_binary_curves(y, p, w)
+    auc_project <- weighted_auc(y, p, w)  # exactly the established project metric
+    if (abs(auc_project - curve$auc_from_curve) > 1e-4) {
+        warning("Project weighted_auc and weighted ROC integral differ for ", family,
+                ": ", round(auc_project, 6), " vs ", round(curve$auc_from_curve, 6))
+    }
+    conf <- weighted_confusion(y, p, w, threshold_fixed)
+    all_curves[[family]] <- curve$points
+    metrics[[family]] <- data.table::data.table(
+        family = family,
+        model = model_names[[family]],
+        respondents = n_eligible,
+        weighted_auroc = auc_project,
+        weighted_average_precision = curve$average_precision,
+        weighted_brier = sum(w * (p - y)^2) / sum(w),
+        weighted_logloss = weighted_logloss(y, p, w),
+        weighted_observed_fmd = weighted_prevalence,
+        weighted_mean_predicted_fmd = sum(w * p) / sum(w),
+        calibration_in_large = sum(w * (p - y)) / sum(w)
+    )
+    threshold_metrics[[family]] <- data.table::copy(conf$metrics)[,
+        `:=`(family = family, model = model_names[[family]])]
+    confusion_cells[[family]] <- data.table::copy(conf$cells)[,
+        `:=`(family = family, model = model_names[[family]])]
+}
+metric_table <- data.table::rbindlist(metrics)
+threshold_table <- data.table::rbindlist(threshold_metrics)
+confusion_table <- data.table::rbindlist(confusion_cells)
+report_table <- merge(metric_table, threshold_table,
+                      by = c("family", "model"), sort = FALSE)
+report_table <- report_table[match(families, family)]
+
+print(report_table[, .(model, respondents, weighted_auroc,
+                       weighted_average_precision, weighted_brier,
+                       weighted_precision, weighted_recall, weighted_f1,
+                       weighted_specificity, weighted_accuracy)])
+print(confusion_table)
+save_table(report_table, "07b_2025_all_models_full_metrics_20_threshold")
+save_table(confusion_table, "07b_2025_weighted_confusion_matrices_20_threshold")
+
+# Keep the national 2023-selected model identified, without reselecting it.
+selected <- load_run_rds("models", "05_frozen_selection")
+cat("[07b] 2023-selected family:", selected$chosen_family, "\n")
+cat("[07b] Weighted 2025 FMD prevalence:", round(100 * weighted_prevalence, 2), "%\n")
+cat("[07b] Fixed threshold:", threshold_fixed,
+    "; results must NOT be described as threshold-optimized.\n")
+```
+
+## 5. Three **separate** ROC figures (AUROC)
+
+Each plot uses the full eligible 2025 population, irrespective of race, with a distinct standalone image for each model. The diagonal shows chance-level discrimination. Only the display coordinates are thinned; AUROC is computed from all eligible weighted predictions.
+
+```{r three-separate-rocs, fig.width=8, fig.height=6, message=FALSE, warning=FALSE}
+for (family in families) {
+    pts <- thin_points(all_curves[[family]])
+    auc <- metrics[[family]]$weighted_auroc
+    p <- ggplot2::ggplot(pts, ggplot2::aes(fpr, tpr)) +
+        ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                             color = "#D5C7BC", linewidth = 0.85) +
+        ggplot2::geom_line(color = model_colors[[family]], linewidth = 1.4) +
+        ggplot2::scale_x_continuous(breaks = seq(0, 1, 0.2)) +
+        ggplot2::scale_y_continuous(breaks = seq(0, 1, 0.2)) +
+        ggplot2::coord_equal(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+        atg_theme() +
+        ggplot2::labs(
+            title = paste0("2025 national ROC — ", model_names[[family]]),
+            subtitle = sprintf("Survey-weighted AUROC = %.4f | n = %s (all races)",
+                               auc, format(n_eligible, big.mark = ",")),
+            x = "False positive rate (1 − specificity)",
+            y = "True positive rate (sensitivity)",
+            caption = "2025 outcomes; frozen model and 2024 calibration. Dashed line = chance."
+        )
+    show_and_save(p, paste0("07b_2025_national_roc_20_threshold_", family), 8, 6)
+}
+```
+
+## 6. Optional combined ROC comparison
+
+```{r combined-roc, fig.width=9, fig.height=6, message=FALSE, warning=FALSE}
+roc_combined <- data.table::rbindlist(lapply(families, function(family) {
+    pts <- data.table::copy(thin_points(all_curves[[family]]))
+    pts[, family := family]
+    pts
+}))
+legend_labels <- stats::setNames(
+    sprintf("%s (%.4f)", model_names[families],
+            metric_table$weighted_auroc[match(families, metric_table$family)]),
+    families
+)
+p <- ggplot2::ggplot(roc_combined, ggplot2::aes(fpr, tpr, color = family)) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                         color = "#D5C7BC") +
+    ggplot2::geom_line(linewidth = 1.1) +
+    ggplot2::scale_color_manual(values = model_colors, breaks = families,
+                                labels = legend_labels[families]) +
+    ggplot2::scale_x_continuous(breaks = seq(0, 1, .2)) +
+    ggplot2::scale_y_continuous(breaks = seq(0, 1, .2)) +
+    ggplot2::coord_equal(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+    atg_theme() +
+    ggplot2::labs(title = "2025 national ROC: three frozen classifiers",
+                  subtitle = "All eligible respondents — survey-weighted",
+                  x = "False positive rate", y = "True positive rate",
+                  color = "Model (AUROC)")
+show_and_save(p, "07b_2025_national_roc_combined_20_threshold", 9, 6)
+```
+
+## 7. Three **separate** precision–recall curves
+
+The positive class is FMD. The dotted horizontal reference is 2025 weighted FMD prevalence. The reported PR summary is **weighted average precision (AP)**, a stepwise precision–recall integral, not ROC AUROC.
+
+```{r three-separate-pr, fig.width=8, fig.height=6, message=FALSE, warning=FALSE}
+for (family in families) {
+    pts <- thin_points(all_curves[[family]])
+    ap <- metrics[[family]]$weighted_average_precision
+    p <- ggplot2::ggplot(pts, ggplot2::aes(recall, precision)) +
+        ggplot2::geom_hline(yintercept = weighted_prevalence,
+                            linetype = "dashed", color = "#BFA58D") +
+        ggplot2::geom_line(color = model_colors[[family]], linewidth = 1.25) +
+        ggplot2::scale_x_continuous(breaks = seq(0, 1, .2)) +
+        ggplot2::scale_y_continuous(breaks = seq(0, 1, .2)) +
+        ggplot2::coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+        atg_theme() +
+        ggplot2::labs(title = paste0("2025 precision–recall — ", model_names[[family]]),
+                      subtitle = sprintf("Weighted average precision = %.4f | FMD prevalence = %.1f%%",
+                                         ap, 100 * weighted_prevalence),
+                      x = "Recall (sensitivity)", y = "Precision (positive predictive value)",
+                      caption = "Curve thinned for display; weighted AP uses all prediction thresholds.")
+    show_and_save(p, paste0("07b_2025_national_pr_", family), 8, 6)
+}
+```
+
+## 8. Optional combined precision–recall comparison
+
+```{r combined-pr, fig.width=9, fig.height=6, message=FALSE, warning=FALSE}
+pr_combined <- data.table::copy(roc_combined)
+ap_labels <- stats::setNames(
+    sprintf("%s (AP %.4f)", model_names[families],
+            metric_table$weighted_average_precision[match(families, metric_table$family)]),
+    families)
+p <- ggplot2::ggplot(pr_combined, ggplot2::aes(recall, precision, color = family)) +
+    ggplot2::geom_hline(yintercept = weighted_prevalence,
+                        linetype = "dashed", color = "#BFA58D") +
+    ggplot2::geom_line(linewidth = 1.1) +
+    ggplot2::scale_color_manual(values = model_colors, breaks = families,
+                                labels = ap_labels[families]) +
+    ggplot2::coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), expand = FALSE) +
+    atg_theme() +
+    ggplot2::labs(title = "2025 national precision–recall comparison",
+                  subtitle = "All respondents, irrespective of race | Dashed = weighted FMD prevalence",
+                  x = "Recall", y = "Precision", color = "Model (AP)")
+show_and_save(p, "07b_2025_national_pr_combined_20_threshold", 9, 6)
+```
+
+## 9. Three **separate** weighted confusion matrices at threshold 0.50
+
+Every heatmap shows **weighted conditional percentages within the actual outcome row**, along with **unweighted respondent counts**. A 50% cutoff is a fixed illustration and was **not** optimized on this evaluation set.
+
+```{r three-confusion-matrices, fig.width=7.5, fig.height=6, message=FALSE, warning=FALSE}
+for (family in families) {
+    cm <- data.table::copy(confusion_cells[[family]])
+    cm[, actual := factor(actual, levels = c("FMD", "No FMD"))]
+    cm[, predicted := factor(predicted, levels = c("No FMD", "FMD"))]
+    cm[, display := sprintf("%s\n%.1f%% of actual class\n(n = %s)",
+                            cell, weighted_row_percent,
+                            format(n_respondents, big.mark = ",", scientific = FALSE))]
+    p <- ggplot2::ggplot(cm, ggplot2::aes(predicted, actual,
+                                         fill = weighted_row_percent)) +
+        ggplot2::geom_tile(color = "white", linewidth = 1.5) +
+        ggplot2::geom_text(ggplot2::aes(label = display), size = 4.2,
+                           lineheight = 1.12, color = "#44362E") +
+        ggplot2::scale_fill_gradient(low = "#F4E9DF", high = "#6CBEB6",
+                                     limits = c(0, 100), name = "Weighted row %") +
+        ggplot2::coord_equal() +
+        atg_theme() +
+        ggplot2::theme(panel.grid = ggplot2::element_blank()) +
+        ggplot2::labs(title = paste0("2025 confusion matrix — ", model_names[[family]]),
+                      subtitle = "All races | Fixed threshold = 0.50",
+                      x = "Predicted class", y = "Actual FMD status",
+                      caption = "Cell percentages are weighted within each actual class; n are unweighted respondents.")
+    show_and_save(p, paste0("07b_2025_national_confusion_", family), 7.5, 6)
+}
+```
+
+## 10. F1, precision, recall and specificity comparison (fixed 0.50 threshold)
+
+```{r classification-metrics-comparison, fig.width=11, fig.height=6, message=FALSE, warning=FALSE}
+classification_long <- data.table::melt(
+    threshold_table,
+    id.vars = c("family", "model", "threshold"),
+    measure.vars = c("weighted_precision", "weighted_recall", "weighted_f1",
+                     "weighted_specificity"),
+    variable.name = "metric", value.name = "score"
+)
+classification_long[, metric := factor(metric,
+    levels = c("weighted_precision", "weighted_recall", "weighted_f1",
+               "weighted_specificity"),
+    labels = c("Precision", "Recall / sensitivity", "F1 score", "Specificity"))]
+classification_long[, model := factor(model, levels = unname(model_names[families]))]
+p <- ggplot2::ggplot(classification_long,
+                     ggplot2::aes(x = model, y = score, fill = family)) +
+    ggplot2::geom_col(width = .64) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", score)),
+                       vjust = -0.28, size = 3.4) +
+    ggplot2::facet_wrap(~metric, nrow = 2) +
+    ggplot2::scale_fill_manual(values = model_colors) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.07), breaks = seq(0, 1, .25)) +
+    atg_theme() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 18, hjust = 1),
+                   legend.position = "none") +
+    ggplot2::labs(title = "2025 national classification metrics at threshold 0.50",
+                  subtitle = "Survey-weighted | Positive class: frequent mental distress",
+                  x = NULL, y = "Metric value (0–1)",
+                  caption = "Classification metrics depend on threshold. 0.50 was not tuned on 2025 outcomes.")
+show_and_save(p, "07b_2025_national_f1_precision_recall_specificity", 11, 6)
+```
+
+## 11. Threshold sensitivity (descriptive only; do not select a cutoff using 2025)
+
+These charts show **how** the three threshold-dependent metrics would vary under different hypothetical cutoffs. They are **diagnostic**, not a permissible procedure for choosing a new 2025 test-set threshold.
+
+```{r threshold-sensitivity, fig.width=11, fig.height=6, message=FALSE, warning=FALSE}
+grid <- seq(0.05, 0.95, by = 0.025)
+threshold_sweep <- data.table::rbindlist(lapply(families, function(family) {
+    p <- eligible[[paste0("prob_", family)]]
+    data.table::rbindlist(lapply(grid, function(t) {
+        z <- weighted_confusion(y, p, w, t)$metrics
+        z[, `:=`(family = family, model = model_names[[family]])]
+        z
+    }))
+}))
+save_table(threshold_sweep, "07b_2025_national_threshold_sensitivity")
+sweep_long <- data.table::melt(threshold_sweep,
+    id.vars = c("family", "model", "threshold"),
+    measure.vars = c("weighted_precision", "weighted_recall", "weighted_f1"),
+    variable.name = "metric", value.name = "score")
+sweep_long[, metric := factor(metric,
+    levels = c("weighted_precision", "weighted_recall", "weighted_f1"),
+    labels = c("Precision", "Recall", "F1"))]
+p <- ggplot2::ggplot(sweep_long,
+                     ggplot2::aes(threshold, score, color = metric)) +
+    ggplot2::geom_line(linewidth = 1.05) +
+    ggplot2::geom_vline(xintercept = threshold_fixed, linetype = "dashed",
+                        color = "#9F9084") +
+    ggplot2::facet_wrap(~model, nrow = 1) +
+    ggplot2::scale_color_manual(values = c("Precision" = "#B66D46",
+                                           "Recall" = "#2D9E98",
+                                           "F1" = "#6E584B")) +
+    ggplot2::coord_cartesian(ylim = c(0, 1)) +
+    atg_theme() +
+    ggplot2::labs(title = "2025 threshold sensitivity — diagnostic only",
+                  subtitle = "Dashed line = fixed reported threshold (0.50)",
+                  x = "Hypothetical probability threshold", y = "Survey-weighted metric",
+                  color = "Metric",
+                  caption = "Do not choose a new threshold by maximizing 2025 F1; tune on earlier data instead.")
+show_and_save(p, "07b_2025_national_threshold_sensitivity", 11, 6)
+```
+
+## 12. Probability calibration curves (weighted within 2025 risk bins)
+
+For each model, predictions are grouped into **up to ten unweighted-count risk quantile bins**, while each bin's reported predicted and observed FMD rates use the respondent survey weights. Tied probabilities are not artificially split; some models may have fewer than ten groups. Points here are **descriptive** and have no confidence intervals.
+
+```{r probability-calibration, fig.width=11, fig.height=6, message=FALSE, warning=FALSE}
+calibration_rows <- list()
+for (family in families) {
+    p <- eligible[[paste0("prob_", family)]]
+    cuts <- unique(as.numeric(stats::quantile(p, probs = seq(0, 1, .1),
+                                              names = FALSE, type = 1)))
+    if (length(cuts) < 2) {
+        warning("All probabilities tied: no calibration bins for ", family)
+        next
+    }
+    bins <- cut(p, breaks = cuts, include.lowest = TRUE, labels = FALSE)
+    d <- data.table::data.table(bin = bins, y = y, p = p, w = w)
+    d <- d[!is.na(bin), .(
+        n_respondents = .N,
+        weight_total = sum(w),
+        predicted = sum(w * p) / sum(w),
+        observed = sum(w * y) / sum(w)
+    ), by = bin]
+    d[, `:=`(family = family, model = model_names[[family]])]
+    calibration_rows[[family]] <- d
+}
+calibration_table <- data.table::rbindlist(calibration_rows, use.names = TRUE)
+save_table(calibration_table, "07b_2025_national_calibration_bins")
+calibration_axis_top <- min(1, max(0.30, 1.08 * max(calibration_table$predicted,
+                                                         calibration_table$observed)))
+p <- ggplot2::ggplot(calibration_table,
+                     ggplot2::aes(predicted, observed, color = family)) +
+    ggplot2::geom_abline(slope = 1, intercept = 0,
+                         color = "#CFC0B3", linetype = "dashed") +
+    ggplot2::geom_line(linewidth = 1.05) +
+    ggplot2::geom_point(size = 2.4) +
+    ggplot2::facet_wrap(~model, nrow = 1) +
+    ggplot2::scale_color_manual(values = model_colors) +
+    ggplot2::coord_equal(xlim = c(0, calibration_axis_top),
+                         ylim = c(0, calibration_axis_top), expand = FALSE) +
+    atg_theme() +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(title = "2025 national calibration by predicted-risk group",
+                  subtitle = "Survey-weighted rates within up to 10 score groups",
+                  x = "Mean predicted FMD probability", y = "Observed FMD proportion",
+                  caption = "Dotted diagonal = ideal calibration; exploratory bins without CIs.")
+show_and_save(p, "07b_2025_national_calibration_curves", 11, 6)
+```
+
+## 13. Calibration-in-the-large (observed versus predicted FMD prevalence)
+
+```{r calibration-in-large, fig.width=9, fig.height=5.5, message=FALSE, warning=FALSE}
+cal_large <- data.table::rbindlist(list(
+    metric_table[, .(family, model, type = "Observed FMD", proportion = weighted_observed_fmd)],
+    metric_table[, .(family, model, type = "Mean predicted FMD", proportion = weighted_mean_predicted_fmd)]
+))
+cal_large[, model := factor(model, levels = unname(model_names[families]))]
+p <- ggplot2::ggplot(cal_large, ggplot2::aes(model, 100 * proportion, fill = type)) +
+    ggplot2::geom_col(position = ggplot2::position_dodge(width = .72), width = .65) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f%%", 100 * proportion)),
+                       position = ggplot2::position_dodge(width = .72),
+                       vjust = -0.28, size = 3.4) +
+    ggplot2::scale_fill_manual(values = c("Observed FMD" = "#B66D46",
+                                          "Mean predicted FMD" = "#2D9E98")) +
+    ggplot2::scale_y_continuous(limits = c(0, max(100 * cal_large$proportion) * 1.17)) +
+    atg_theme() +
+    ggplot2::labs(title = "2025 national: observed vs mean predicted FMD",
+                  subtitle = "All eligible respondents, survey-weighted",
+                  x = NULL, y = "FMD prevalence / predicted probability (%)",
+                  fill = NULL)
+show_and_save(p, "07b_2025_national_observed_vs_predicted", 9, 5.5)
+```
+
+## 14. Weighted distributions of predicted probabilities by actual FMD status
+
+Bin-level weight fractions are normalized **separately within each actual outcome class**. The resulting distributions help show overlap, but are not measures of classification accuracy by themselves.
+
+```{r predicted-score-distributions, fig.width=11, fig.height=6, message=FALSE, warning=FALSE}
+score_histograms <- data.table::rbindlist(lapply(families, function(family) {
+    p <- eligible[[paste0("prob_", family)]]
+    d <- data.table::data.table(
+        bin = pmin(39L, as.integer(floor(p * 40))), y = y, w = w)
+    d <- d[, .(weight = sum(w)), by = .(bin, y)]
+    d[, fraction := weight / sum(weight), by = y]
+    d[, `:=`(family = family, model = model_names[[family]],
+             midpoint = (bin + 0.5) / 40,
+             outcome = ifelse(y == 1, "FMD", "No FMD"))]
+    d
+}))
+save_table(score_histograms, "07b_2025_national_score_distribution_bins")
+p <- ggplot2::ggplot(score_histograms,
+                     ggplot2::aes(midpoint, fraction, color = outcome)) +
+    ggplot2::geom_line(linewidth = 1.05) +
+    ggplot2::facet_wrap(~model, nrow = 1, scales = "free_y") +
+    ggplot2::scale_color_manual(values = c("FMD" = positive_color,
+                                           "No FMD" = negative_color)) +
+    atg_theme() +
+    ggplot2::labs(title = "2025 predicted-risk distributions by observed FMD",
+                  subtitle = "Survey-weighted percentage distribution within each actual outcome class",
+                  x = "Predicted FMD probability", y = "Fraction of outcome class per 0.025 risk bin",
+                  color = "Actual FMD")
+show_and_save(p, "07b_2025_national_score_distributions", 11, 6)
+```
+
+## 15. Comparing probability-based metrics
+
+AUROC and average precision are **higher-is-better**; Brier score and log loss are **lower-is-better**. These are displayed in separate panels with independent scales to avoid misleading direct numerical comparisons.
+
+```{r probability-metrics-dashboard, fig.width=11, fig.height=6, message=FALSE, warning=FALSE}
+prob_metric_long <- data.table::melt(
+    metric_table,
+    id.vars = c("family", "model"),
+    measure.vars = c("weighted_auroc", "weighted_average_precision",
+                     "weighted_brier", "weighted_logloss"),
+    variable.name = "metric", value.name = "score")
+prob_metric_long[, metric := factor(metric,
+    levels = c("weighted_auroc", "weighted_average_precision",
+               "weighted_brier", "weighted_logloss"),
+    labels = c("AUROC ↑", "Average precision ↑", "Brier score ↓", "Log loss ↓"))]
+prob_metric_long[, model := factor(model, levels = unname(model_names[families]))]
+p <- ggplot2::ggplot(prob_metric_long,
+                     ggplot2::aes(model, score, fill = family)) +
+    ggplot2::geom_col(width = .66) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.4f", score)),
+                       vjust = -0.3, size = 3) +
+    ggplot2::facet_wrap(~metric, nrow = 2, scales = "free_y") +
+    ggplot2::scale_fill_manual(values = model_colors) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, .20))) +
+    atg_theme() +
+    ggplot2::theme(legend.position = "none",
+                   axis.text.x = ggplot2::element_text(angle = 18, hjust = 1)) +
+    ggplot2::labs(title = "2025 national model performance summary",
+                  subtitle = "One eligible sample, same frozen predictions, survey-weighted",
+                  x = NULL, y = NULL,
+                  caption = "Panels have independent vertical scales and must be interpreted separately.")
+show_and_save(p, "07b_2025_national_probability_metrics_dashboard", 11, 6)
+```
+
+## 16. Figure list and interpretation guidance
+
+**Individual ROC figures**
+
+- `07b_2025_national_roc_logistic`
+- `07b_2025_national_roc_lasso`
+- `07b_2025_national_roc_forest`
+
+**Individual precision–recall figures**
+
+- `07b_2025_national_pr_logistic`
+- `07b_2025_national_pr_lasso`
+- `07b_2025_national_pr_forest`
+
+**Individual confusion matrices**
+
+- `07b_2025_national_confusion_logistic`
+- `07b_2025_national_confusion_lasso`
+- `07b_2025_national_confusion_forest`
+
+**Other useful figures**
+
+- `07b_2025_national_roc_combined`
+- `07b_2025_national_pr_combined`
+- `07b_2025_national_f1_precision_recall_specificity`
+- `07b_2025_national_threshold_sensitivity`
+- `07b_2025_national_calibration_curves`
+- `07b_2025_national_observed_vs_predicted`
+- `07b_2025_national_score_distributions`
+- `07b_2025_national_probability_metrics_dashboard`
+
+All filenames are passed to the project's existing `show_and_save()` function, and tables to `save_table()`, under the attached run. No model or dataset checkpoints are overwritten.
+
+For overall performance, the combined ROC figure, standalone ROC figures, and model-performance table provide complementary views. F1 and confusion matrices are threshold-dependent supplemental results; population-specific reliability is evaluated in Notebook 08.

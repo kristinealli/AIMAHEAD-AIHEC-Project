@@ -1,0 +1,557 @@
+---
+title: "12 — Exploratory PSU-bootstrap subgroup AUROC uncertainty"
+output: html_notebook
+---
+
+**Measures:** sensitivity of the observed 2025 AI/AN-minus-comparison AUROC gap to stratified resampling of primary sampling units (PSUs), keeping model predictions fixed. **Important:** these are approximate conditional intervals, not guaranteed design-consistent BRFSS estimates or uncertainty from model development.
+
+## Setup
+
+Loads the unchanged input settings, shared model functions, and the persistent run
+increment. The output suffix identifies this run.
+
+```{r setup}
+# Set the project root, then load R code from the shared R Notebooks.
+
+# -----------------------------------------------------------------------------
+# Project-root discovery
+# -----------------------------------------------------------------------------
+
+# Search upward for the project marker so notebook paths do not depend on a particular
+# subfolder.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    # Walk toward the filesystem root until the project marker is found.
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        # Move up one directory; an unchanged parent marks the filesystem root.
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+
+# -----------------------------------------------------------------------------
+# Notebook execution root
+# -----------------------------------------------------------------------------
+
+# Resolve the project before loading modules; configure subsequent knitr chunks to use
+# that root.
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+
+# -----------------------------------------------------------------------------
+# Shared-module loader
+# -----------------------------------------------------------------------------
+
+# Extract R chunks in source order and evaluate them in the caller environment.
+# This lightweight loader does not process chunk options such as eval = FALSE.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        # Use the next standalone closing fence for this R chunk.
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Shared settings and utilities
+# -----------------------------------------------------------------------------
+
+# Load configuration before helpers, retaining the existing presentation palette module.
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+
+# -----------------------------------------------------------------------------
+# Existing-run attachment
+# -----------------------------------------------------------------------------
+
+# Attach to an allocated run rather than incrementing the counter in this stage.
+run_context <- attach_run()
+cat("[RUN] Current increment:", run_context$id, "\n")
+```
+
+
+
+## Resample design clusters and estimate subgroup AUROC
+
+Resamples entire PSUs within the source strata and uses the same resample for both
+groups. Samples with singleton PSUs cannot contribute the full variance and are held
+fixed; the method requires independent validation for a publication-quality claim.
+
+```{r psu-bootstrap}
+# -----------------------------------------------------------------------------
+# Fixed-model cluster resampling
+# -----------------------------------------------------------------------------
+
+# Use a common within-stratum PSU draw for both populations in each replicate.
+# Hold predictions fixed and interpret percentile intervals as exploratory
+# approximations.
+
+# Bootstrap fixed 2025 predictions at the survey PSU level, not individual rows.
+# This is an APPROXIMATE stratified-cluster resampling sensitivity analysis.
+# It does not refit the model and does not replace the CDC design-based variance method.
+scored <- load_run_rds("checkpoints", "07_scored_2025")
+selected <- load_run_rds("models", "05_frozen_selection")
+if (anyNA(scored[, .(YEAR, STATE, STRAT, PSU, RAW_WEIGHT)])) {
+    stop("Survey design identifiers cannot be missing for the PSU bootstrap")
+}
+scored[, stratum_key := paste(YEAR, STATE, STRAT, sep = "_")]
+scored[, psu_key := paste(YEAR, STATE, STRAT, PSU, sep = "_")]
+
+# Build strata from the complete weighted 2025 survey before extracting subgroups.
+psu_table <- unique(scored[, .(stratum_key, psu_key)])
+psu_table[, psu_index := seq_len(.N)]
+strata_indices <- split(psu_table$psu_index, psu_table$stratum_key)
+scored[, psu_index := psu_table$psu_index[match(psu_key, psu_table$psu_key)]]
+if (anyNA(scored$psu_index)) {
+    stop("Could not map every observation to its original survey PSU")
+}
+primary <- scored[cohort %in% primary_groups & valid_outcome(FMD)]
+if (!all(primary_groups %in% unique(primary$cohort))) {
+    stop("Both comparison groups are required for the AUROC bootstrap")
+}
+
+# Exactly the same PSU resample supplies BOTH groups in each replicate,
+# preserving covariance in the AUROC difference.
+replicates <- vector("list", psu_bootstrap_replicates)
+
+# Set the random seed before stochastic operations so the same inputs can reproduce this
+# sampling sequence.
+set.seed(seed + 1205L)
+
+# Iterate through the configured analysis items in the original execution order.
+for (replicate in seq_len(psu_bootstrap_replicates)) {
+    # Start all PSU multiplicities at zero before drawing within each stratum.
+    counts <- integer(nrow(psu_table))
+    for (indices in strata_indices) {
+        if (length(indices) == 1L) {
+            # Hold singleton strata fixed; this resampling cannot estimate their
+            # variability.
+            counts[indices] <- 1L
+        } else {
+            draws <- sample.int(
+                length(indices),
+                size = length(indices),
+                replace = TRUE
+            )
+            counts[indices] <- tabulate(draws, nbins = length(indices))
+        }
+    }
+
+    # A PSU absent from a replicate receives zero weight; no rows are imputed.
+    multiplied_weights <- primary$RAW_WEIGHT * counts[primary$psu_index]
+    ai_index <- primary$cohort == primary_groups[1]
+    other_index <- primary$cohort == primary_groups[2]
+    auc_ai <- weighted_auc(
+        primary$FMD[ai_index],
+        primary$selected_probability[ai_index],
+        multiplied_weights[ai_index]
+    )
+    auc_other <- weighted_auc(
+        primary$FMD[other_index],
+        primary$selected_probability[other_index],
+        multiplied_weights[other_index]
+    )
+    replicates[[replicate]] <- data.frame(
+        replicate = replicate,
+        auc_ai_an = auc_ai,
+        auc_other_single_race = auc_other,
+        auc_gap = auc_ai - auc_other
+    )
+    if (replicate %% 25L == 0L) {
+        cat("[BOOTSTRAP] Finished", replicate, "PSU replicates\n")
+    }
+}
+replicate_table <- data.table::rbindlist(replicates)
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(replicate_table, "12_psu_bootstrap_auc_replicates")
+
+# Calculate the point estimate from the unresampled, weighted 2025 observations.
+base_ai <- primary[cohort == primary_groups[1]]
+base_other <- primary[cohort == primary_groups[2]]
+point_ai <- weighted_auc(
+    base_ai$FMD, base_ai$selected_probability, base_ai$RAW_WEIGHT
+)
+point_other <- weighted_auc(
+    base_other$FMD, base_other$selected_probability, base_other$RAW_WEIGHT
+)
+point <- c(point_ai, point_other, point_ai - point_other)
+metric_columns <- c("auc_ai_an", "auc_other_single_race", "auc_gap")
+summary_rows <- lapply(seq_along(metric_columns), function(index) {
+    values <- replicate_table[[metric_columns[index]]]
+    good <- values[is.finite(values)]
+    if (length(good) < 30L) {
+        stop("Too few valid PSU bootstrap replicates for ", metric_columns[index])
+    }
+    # Use finite replicates for the approximate 95% percentile interval.
+    interval <- stats::quantile(good, c(0.025, 0.975), names = FALSE)
+    data.frame(
+        metric = metric_columns[index],
+        point_estimate = point[index],
+        bootstrap_replicates = length(good),
+        ci_lower = interval[1],
+        ci_upper = interval[2],
+        method = "approximate fixed-model stratified PSU resampling"
+    )
+})
+intervals <- data.table::rbindlist(summary_rows)
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(intervals, "12_psu_bootstrap_auc_intervals")
+print(intervals)
+cat("Interpretation: exploratory PSU-resampling intervals, not a definitive CDC design-based inference.\n")
+```
+
+
+## Visualize AUROC-gap resampling uncertainty
+
+Displays the distribution across replicate samples and explicitly marks zero and the
+original observed gap. The histogram appears in the notebook as well as being saved.
+
+```{r show-bootstrap}
+# -----------------------------------------------------------------------------
+# AUROC-gap resampling distribution
+# -----------------------------------------------------------------------------
+
+# Display the approximate resampling distribution alongside zero and the observed gap.
+# The resampling excludes uncertainty from fitting and selecting the classifier.
+
+# Show the resampled distribution alongside the original point estimate.
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+
+# Build the chart using the existing palette and theme; retain the original scales and
+# labels.
+plot <- ggplot2::ggplot(
+    replicate_table,
+    ggplot2::aes(x = auc_gap)
+) +
+    ggplot2::geom_histogram(bins = 24, fill = atg_palette[["rose"]], color = "white") +
+    ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["burgundy"]]
+    ) +
+    ggplot2::geom_vline(xintercept = point[3], color = atg_palette[["evergreen"]]) +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Approximate PSU-bootstrap distribution of the 2025 AUROC gap",
+        subtitle = paste("AI/AN alone minus other single-race |", selected$chosen_family),
+        x = "Weighted AUROC difference",
+        y = "Resampling replicates",
+        caption = "Fixed predictions; within-stratum PSU resampling. Exploratory approximation, not CDC replicate weights."
+    )
+show_and_save(plot, "12_psu_bootstrap_auc_gap", 9, 5)
+```
+```{r}
+# -----------------------------------------------------------------------------
+# Bootstrap summary for plotting
+# -----------------------------------------------------------------------------
+
+# Compute an approximate percentile interval from the bootstrap replicates.
+ci <- stats::quantile(
+    replicate_table$auc_gap,
+    probs = c(0.025, 0.975),
+    na.rm = TRUE
+)
+
+# Keep the observed point estimate explicit.
+observed_gap <- point[3]
+
+# Optional descriptive values for annotation.
+bootstrap_mean <- mean(replicate_table$auc_gap, na.rm = TRUE)
+
+subtitle_text <- paste0(
+    "AI/AN alone minus other single-race | ",
+    selected$chosen_family,
+    " | observed gap = ",
+    sprintf("%+.1f pp", 100 * observed_gap),
+    " | approx. 95% bootstrap interval = ",
+    sprintf("%+.1f pp", 100 * ci[1]),
+    " to ",
+    sprintf("%+.1f pp", 100 * ci[2])
+)
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+plot <- ggplot2::ggplot(
+    replicate_table,
+    ggplot2::aes(x = auc_gap)
+) +
+    # Shade the central 95% bootstrap interval first so it sits behind the bars.
+    ggplot2::annotate(
+        "rect",
+        xmin = ci[1],
+        xmax = ci[2],
+        ymin = -Inf,
+        ymax = Inf,
+        alpha = 0.10,
+        fill = atg_palette[["evergreen"]]
+    ) +
+    ggplot2::geom_histogram(
+        binwidth = 0.005,
+        boundary = 0,
+        fill = atg_palette[["turquoise"]],
+        color = "white",
+        linewidth = 0.3
+    ) +
+    # Zero line: no subgroup difference.
+    ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["burgundy"]],
+        linewidth = 0.8
+    ) +
+    # Observed point estimate.
+    ggplot2::geom_vline(
+        xintercept = observed_gap,
+        color = atg_palette[["evergreen"]],
+        linewidth = 1
+    ) +
+    # Optional CI boundary lines.
+    ggplot2::geom_vline(
+        xintercept = ci,
+        linetype = "dotted",
+        color = atg_palette[["evergreen"]],
+        linewidth = 0.7
+    ) +
+    ggplot2::scale_x_continuous(
+        labels = function(values) sprintf("%+.1f pp", 100 * values)
+    ) +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Approximate PSU-bootstrap distribution of the 2025 AUROC gap",
+        subtitle = subtitle_text,
+        x = "Weighted AUROC difference (AI/AN minus comparison, percentage points)",
+        y = "Bootstrap replicates",
+        caption = paste(
+            "Shaded band = central 95% bootstrap interval.",
+            "Green line = observed AUROC gap.",
+            "Dashed burgundy line = no subgroup difference."
+        )
+    )
+
+show_and_save(plot, "12_psu_bootstrap_auc_gap_enhanced", 9, 5)
+```
+```{r}
+
+# -----------------------------------------------------------------------------
+# Publication-style 2025 AUROC gap interval plot
+# -----------------------------------------------------------------------------
+
+# Compare the selected model's weighted AUROC between
+# AI/AN-alone and other identified single-race adults.
+#
+# Negative differences indicate lower AI/AN AUROC.
+# Confidence intervals are approximate percentile intervals
+# from the existing within-stratum PSU bootstrap.
+
+# Retain finite bootstrap replicates.
+bootstrap_values <- replicate_table$auc_gap
+bootstrap_values <- bootstrap_values[
+    is.finite(bootstrap_values)
+]
+
+stopifnot(
+    length(bootstrap_values) >= 50L,
+    is.finite(point[3])
+)
+
+# Calculate the approximate 95% bootstrap interval.
+ci <- stats::quantile(
+    bootstrap_values,
+    probs = c(0.025, 0.975),
+    names = FALSE
+)
+
+# Convert AUROC differences to percentage-point units.
+gap_summary <- data.table::data.table(
+    estimate_pp = 100 * as.numeric(point[3]),
+    ci_l_pp = 100 * ci[1],
+    ci_u_pp = 100 * ci[2],
+    bootstrap_replicates = length(bootstrap_values)
+)
+
+# Prepare exact labels from the calculated results.
+estimate_label <- sprintf(
+    "%+.2f pp",
+    gap_summary$estimate_pp
+)
+
+interval_label <- sprintf(
+    "95%% bootstrap interval: %+.2f to %+.2f pp",
+    gap_summary$ci_l_pp,
+    gap_summary$ci_u_pp
+)
+
+# Describe whether the approximate interval includes zero.
+includes_zero <- (
+    gap_summary$ci_l_pp <= 0 &
+    gap_summary$ci_u_pp >= 0
+)
+
+interpretation <- if (includes_zero) {
+    "Approximate interval includes zero"
+} else {
+    "Approximate interval excludes zero"
+}
+
+# Leave breathing room around the interval and zero.
+x_min <- min(0, gap_summary$ci_l_pp, gap_summary$estimate_pp) - 0.8
+x_max <- max(0, gap_summary$ci_u_pp, gap_summary$estimate_pp) + 0.8
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+plot <- ggplot2::ggplot(gap_summary) +
+    # Zero indicates equal AUROC between populations.
+    ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["burgundy"]],
+        linewidth = 0.9
+    ) +
+    # Approximate 95% bootstrap confidence interval.
+    ggplot2::geom_segment(
+        ggplot2::aes(
+            x = ci_l_pp,
+            xend = ci_u_pp,
+            y = 1,
+            yend = 1
+        ),
+        color = atg_palette[["evergreen"]],
+        linewidth = 1.6
+    ) +
+    # Left confidence interval cap.
+    ggplot2::geom_segment(
+        ggplot2::aes(
+            x = ci_l_pp,
+            xend = ci_l_pp,
+            y = 0.96,
+            yend = 1.04
+        ),
+        color = atg_palette[["evergreen"]],
+        linewidth = 1.2
+    ) +
+    # Right confidence interval cap.
+    ggplot2::geom_segment(
+        ggplot2::aes(
+            x = ci_u_pp,
+            xend = ci_u_pp,
+            y = 0.96,
+            yend = 1.04
+        ),
+        color = atg_palette[["evergreen"]],
+        linewidth = 1.2
+    ) +
+    # Observed AUROC difference.
+    ggplot2::geom_point(
+        ggplot2::aes(
+            x = estimate_pp,
+            y = 1
+        ),
+        color = atg_palette[["evergreen"]],
+        size = 4.5
+    ) +
+    # Display the estimate directly above the point.
+    ggplot2::geom_text(
+        ggplot2::aes(
+            x = estimate_pp,
+            y = 1.15,
+            label = estimate_label
+        ),
+        color = atg_palette[["evergreen"]],
+        fontface = "bold",
+        size = 4.5
+    ) +
+    ggplot2::scale_x_continuous(
+        labels = function(values) {
+            sprintf("%+.1f pp", values)
+        },
+        breaks = scales::pretty_breaks(n = 6)
+    ) +
+    ggplot2::scale_y_continuous(
+        breaks = 1,
+        labels = "2025 logistic model",
+        limits = c(0.78, 1.35)
+    ) +
+    ggplot2::coord_cartesian(
+        xlim = c(x_min, x_max),
+        clip = "off"
+    ) +
+    atg_theme() +
+    ggplot2::theme(
+        panel.grid.major.y = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        axis.title.y = ggplot2::element_blank(),
+        axis.text.y = ggplot2::element_text(
+            face = "bold",
+            size = 11
+        ),
+        plot.caption = ggplot2::element_text(
+            size = 8,
+            hjust = 0,
+            margin = ggplot2::margin(t = 14)
+        )
+    ) +
+    ggplot2::labs(
+        title = "Does model discrimination differ for AI/AN adults?",
+        subtitle = paste(
+            "2025 survey-weighted AUROC difference |",
+            selected$chosen_family,
+            "\n",
+            interval_label,
+            "|",
+            interpretation
+        ),
+        x = "AI/AN minus comparison AUROC (percentage points)",
+        caption = paste(
+            "Point = observed subgroup AUROC difference;",
+            "whisker = approximate 95% PSU-bootstrap percentile interval.",
+            "\nNegative values indicate lower AI/AN discrimination.",
+            "Dashed line indicates no difference.",
+            "\nFixed predictions; within-stratum PSU resampling.",
+            "Exploratory approximation, not CDC replicate weights."
+        )
+    )
+
+# Save under a distinct filename to preserve the histogram.
+show_and_save(
+    plot,
+    "12_2025_auc_gap_interval",
+    11,
+    4.5
+)
+
+print(gap_summary)
+
+```
+Note: The interval includes zero, so the observed difference is not conclusive under this bootstrap approximation.
