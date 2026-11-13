@@ -1,0 +1,338 @@
+---
+title: "17 — Sampling uncertainty for the composition-adjusted AI/AN gap"
+output: html_notebook
+---
+
+**Research question:**
+Does the 2025 AI/AN AUROC gap appear to persist once age-and-sex composition and approximate
+sampling uncertainty are considered?
+
+**Measures:**
+paired original-versus-standardized AUROC gaps in 2025, using within-stratum PSU bootstrap resampling
+with all model predictions held fixed. The resampling retains both populations in each replicate and
+recomputes the standardization target.
+
+This is a **sensitivity approximation**, not an official BRFSS replicate-weight
+estimator or a definitive complex-survey confidence interval. It excludes model-fitting,
+calibration, and harmonization uncertainty.
+
+**Measures:** verifies that this notebook is operating under the current
+numbered run and reading the frozen classifier.
+
+```{r setup}
+# Find the original RStudio project
+
+# -----------------------------------------------------------------------------
+# Project-root discovery
+# -----------------------------------------------------------------------------
+
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    # Walk toward the filesystem root until the project marker is found.
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        # Move up one directory; an unchanged parent marks the filesystem root.
+        parent <- dirname(current)
+        if (identical(current, parent)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Notebook execution root
+# -----------------------------------------------------------------------------
+
+# Resolve the project before loading modules; configure subsequent knitr chunks to use
+# that root.
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+# Read the executable code blocks from existing shared R Notebooks.
+
+# -----------------------------------------------------------------------------
+# Shared-module loader
+# -----------------------------------------------------------------------------
+
+# Extract R chunks in source order and evaluate them in the caller environment.
+# This lightweight loader does not process chunk options such as eval = FALSE.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    lines <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+    blocks <- lapply(starts, function(start) {
+        # Use the next standalone closing fence for this R chunk.
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Incomplete R code chunk in ", path)
+        }
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Shared settings and utilities
+# -----------------------------------------------------------------------------
+
+# Load configuration before helpers, retaining the existing presentation palette module.
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+load_module("addon_insight_helpers")
+
+# -----------------------------------------------------------------------------
+# Existing-run attachment
+# -----------------------------------------------------------------------------
+
+# Attach to an allocated run rather than incrementing the counter in this stage.
+run_context <- attach_run()
+# Resolve the frozen model run separately from the current output run.
+source_run_id <- get_source_run_id()
+cat("[ADD-ON] New increment:", run_context$id, "| Original model run:", source_run_id, "\n")
+```
+
+
+## Reconstruct the 2025 survey sampling units
+
+**Measures:** the source survey strata and PSUs, preserving the original
+sample's clustering before restricting to the comparison groups.
+
+```{r identify-design-units}
+# -----------------------------------------------------------------------------
+# Survey clusters and fixed demographic support
+# -----------------------------------------------------------------------------
+
+# Map records to source strata and PSUs before restricting to the analysis groups.
+# Keep common demographic cells fixed while replicate weights change.
+
+# Build distinct design keys on all 2025 records before removing survey outcomes.
+full <- data.table::as.data.table(load_source_rds("checkpoints", "07_scored_2025"))
+if (anyNA(full$STATE) || anyNA(full$STRAT) || anyNA(full$PSU)) {
+    stop("Missing 2025 survey-design keys; audit data before PSU resampling")
+}
+full[, stratum_key := paste(STATE, STRAT, sep = "::")]
+full[, psu_key := paste(STATE, STRAT, PSU, sep = "::")]
+psu_table <- unique(full[, .(stratum_key, psu_key)])
+psu_table[, psu_index := seq_len(.N)]
+strata_indices <- split(psu_table$psu_index, psu_table$stratum_key)
+
+# A source PSU may have members from either or both population groups.
+full[, psu_index := psu_table$psu_index[match(psu_key, psu_table$psu_key)]]
+if (anyNA(full$psu_index)) {
+    stop("Unable to map every 2025 respondent to a PSU")
+}
+
+primary <- data.table::copy(full)[
+    cohort %in% primary_groups &
+        valid_outcome(FMD) &
+        valid_weight(RAW_WEIGHT) &
+        is.finite(selected_probability)
+]
+primary[, age_sex_cell := paste(AGE_BAND, SEX_CLEAN, sep = " | ")]
+
+# Hold common demographic cells fixed across replicates; estimation weights vary.
+common_cells <- find_common_cells(primary, "age_sex_cell", min_cell_n = 30L)
+if (!length(common_cells)) {
+    stop("No common age-by-sex support for the two groups")
+}
+source_model <- get_source_model()
+selected <- source_model$selection
+
+# Flag strata with one PSU; their variation cannot be estimated by this bootstrap.
+single_psu_strata <- sum(lengths(strata_indices) == 1L)
+cat("[DESIGN] Unique PSUs:", nrow(psu_table),
+    "| Strata:", length(strata_indices),
+    "| Single-PSU strata:", single_psu_strata, "\n")
+```
+
+## Recalculate performance under paired PSU draws
+
+**Measures:** the unstandardized AUROC gap, the common-support standardized
+gap, and their difference in each paired bootstrap replicate. The model is frozen; the
+primary uncertainty is from resampling survey clusters.
+
+```{r run-paired-bootstrap}
+# -----------------------------------------------------------------------------
+# Paired original and standardized gaps
+# -----------------------------------------------------------------------------
+
+# Apply the same PSU multiplicities to both groups in each replicate.
+# Recompute standardized weights while keeping predictions and the common-cell set
+# fixed.
+
+# Return the two AUROC gaps for a supplied vector of survey-reweighted records.
+calculate_gaps <- function(weights) {
+    # Drop zero-weight PSU draws before calculating replicate metrics.
+    nonzero <- which(valid_weight(weights))
+    subset <- data.table::copy(primary[nonzero])
+    subset[, replicate_weight := weights[nonzero]]
+
+    original <- score_groups(
+        subset,
+        weight_column = "replicate_weight",
+        scenario = "original",
+        historical_prevalence = selected$training_prevalence
+    )
+    standardized <- standardize_weights(
+        subset,
+        raw_weights = subset$replicate_weight,
+        cell_column = "age_sex_cell",
+        common_cells = common_cells
+    )
+    adjusted <- score_groups(
+        standardized,
+        weight_column = "standardized_weight",
+        scenario = "standardized",
+        historical_prevalence = selected$training_prevalence
+    )
+    raw_gap <- gap_from_metrics(original, "auc")
+    adjusted_gap <- gap_from_metrics(adjusted, "auc")
+    c(
+        original_gap = raw_gap,
+        standardized_gap = adjusted_gap,
+        change_after_restriction_and_standardization = adjusted_gap - raw_gap
+    )
+}
+
+# Always show the exact observed point estimates before bootstrap uncertainty.
+point_estimate <- calculate_gaps(primary$RAW_WEIGHT)
+replicate_count <- if (run_mode == "quick") 99L else 399L
+
+# Set the random seed before stochastic operations so the same inputs can reproduce this
+# sampling sequence.
+set.seed(seed + 1705L)
+bootstrap_rows <- vector("list", replicate_count)
+
+
+# Iterate through the configured analysis items in the original execution order.
+for (iteration in seq_len(replicate_count)) {
+    # Start all PSU multiplicities at zero before drawing within each stratum.
+    counts <- integer(nrow(psu_table))
+    for (psus in strata_indices) {
+        if (length(psus) == 1L) {
+            # Hold singleton strata fixed; this resampling cannot estimate their
+            # variability.
+            counts[psus] <- 1L
+        } else {
+            draws <- sample.int(length(psus), length(psus), replace = TRUE)
+            counts[psus] <- tabulate(draws, nbins = length(psus))
+        }
+    }
+    replicate_weights <- primary$RAW_WEIGHT * counts[primary$psu_index]
+    result <- tryCatch(
+        calculate_gaps(replicate_weights),
+        error = function(error) {
+            warning("Replicate ", iteration, ": ", conditionMessage(error))
+            c(
+                original_gap = NA_real_,
+                standardized_gap = NA_real_,
+                change_after_restriction_and_standardization = NA_real_
+            )
+        }
+    )
+    bootstrap_rows[[iteration]] <- data.frame(
+        replicate = iteration,
+        original_gap = result["original_gap"],
+        standardized_gap = result["standardized_gap"],
+        change_after_restriction_and_standardization = result["change_after_restriction_and_standardization"]
+    )
+    if (iteration %% 25L == 0L) {
+        cat("[BOOTSTRAP] Completed", iteration, "paired resamples\n")
+    }
+}
+
+replicates <- data.table::rbindlist(bootstrap_rows)
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(replicates, "17_paired_psu_bootstrap_replicates")
+
+# Percentile intervals are descriptive approximations, not official design CIs.
+interval_rows <- lapply(names(point_estimate), function(metric) {
+    valid <- replicates[[metric]][is.finite(replicates[[metric]])]
+    if (length(valid) < 30L) {
+        stop("Too few valid bootstrap replicates for ", metric)
+    }
+    # Use finite replicates for the approximate 95% percentile interval.
+    interval <- stats::quantile(valid, c(0.025, 0.975), names = FALSE)
+    data.frame(
+        metric = metric,
+        original_point = unname(point_estimate[metric]),
+        lower_approx = interval[1],
+        upper_approx = interval[2],
+        valid_replicates = length(valid),
+        method = "fixed-model stratified-PSU bootstrap approximation"
+    )
+})
+intervals <- data.table::rbindlist(interval_rows)
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(intervals, "17_paired_gap_uncertainty")
+print(intervals)
+cat("[CAUTION] This is exploratory. An interval containing zero is inconclusive.\n")
+```
+
+## Show paired differences and their uncertainty
+
+**Measures:** the distributions of the raw, demographic-standardized, and
+change-in-gap estimates across the same bootstrap draws. The change reflects both
+common-support exclusions and demographic reweighting. Zero marks no gap.
+
+```{r plot-bootstrap-uncertainty}
+# -----------------------------------------------------------------------------
+# Paired-gap resampling distributions
+# -----------------------------------------------------------------------------
+
+# Display the original gap, standardized gap, and their paired difference.
+# The difference combines common-support restriction and composition reweighting.
+
+# Show the resampling distribution in the notebook and save it with the run ID.
+long <- data.table::melt(
+    replicates,
+    id.vars = "replicate",
+    measure.vars = c(
+        "original_gap",
+        "standardized_gap",
+        "change_after_restriction_and_standardization"
+    ),
+    variable.name = "metric",
+    value.name = "difference"
+)
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+
+# Build the chart using the existing palette and theme; retain the original scales and
+# labels.
+bootstrap_plot <- ggplot2::ggplot(
+    long[is.finite(difference)],
+    ggplot2::aes(x = difference)
+) +
+    ggplot2::geom_histogram(bins = 25, fill = atg_palette[["rose"]], color = "white") +
+    ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["burgundy"]]
+    ) +
+    ggplot2::facet_wrap(~metric, scales = "free_y", ncol = 1) +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Estimated sampling uncertainty of the 2025 performance gap",
+        subtitle = "Identical fixed model; both populations share every PSU resample",
+        x = "AI/AN-minus-comparison AUROC difference (or change)",
+        y = "Number of replicates",
+        caption = "Exploratory PSU-resampling approximation; model uncertainty is excluded."
+    )
+show_and_save(bootstrap_plot, "17_paired_gap_bootstrap", 10, 9)
+```

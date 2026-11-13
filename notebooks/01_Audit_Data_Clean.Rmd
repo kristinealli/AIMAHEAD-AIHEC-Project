@@ -1,0 +1,550 @@
+---
+title: "01 — BRFSS data audit and annual mental-distress prevalence"
+subtitle: "2014–2024 | Survey-weighted descriptive analysis"
+output:
+    html_notebook:
+        toc: true
+        toc_depth: 3
+---
+
+## Purpose and research context
+
+This notebook establishes the descriptive context for the FMD project **before** model training. It measures annual coverage, outcome and predictor nonresponse, the distribution of BRFSS survey weights, and reported **frequent mental distress (FMD)** among American Indian and Alaska Native (AI/AN)-alone adults and other identified single-race adults.
+
+**Outcome:** `FMD = 1` means 14 or more self-reported mentally unhealthy days during the preceding 30 days; `FMD = 0` means fewer than 14 days. Unknown or refused outcomes are excluded from the prevalence numerator and denominator, but retained in the audit.
+
+**Outputs:** two visible charts—annual prevalence with 95% confidence intervals and the annual AI/AN-minus-comparison difference with 95% confidence intervals—plus their supporting tables. This is **not** a prediction model, causal analysis, or longitudinal follow-up of the same individuals. The separate 2025 file is not used.
+
+**Important prerequisite:** Verify from the original BRFSS import/recoding script that `RAW_WEIGHT` is the unchanged CDC `_LLCPWT` weight, `STRAT` is `_STSTR`, and `PSU` corresponds to `_PSU`. A plausible audit does *not* establish these mappings. The survey intervals below are conditional on that verification and on the exclusions used to construct the processed dataset.
+
+## 1. Load existing project helpers and attach the run
+
+This cell finds the RStudio project and loads your existing helper and graph-palette modules. When called from the master notebook, it **uses the current run increment**; when knitted independently, it **allocates a new increment** so no previous artifacts are overwritten.
+
+```{r setup, message=FALSE}
+# Find the existing RStudio project root without hard-coded local paths.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio before running this notebook.")
+        }
+
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+# Evaluate the shared R Markdown modules, preserving your current project setup.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    lines <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing executable chunk or closing fence in ", path)
+        }
+
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+
+# The survey package is required for design-aware uncertainty estimates.
+check_packages(c("data.table", "ggplot2", "scales", "survey"))
+
+# Keep the master-notebook increment; allocate a new one for standalone knitting.
+if (!nzchar(Sys.getenv("ATG_RUN_ID", unset = ""))) {
+    start_new_run()
+}
+
+run_context <- attach_run()
+cat("[RUN] Audit increment:", run_context$id, "\n")
+```
+
+## 2. Load the historical dataset and audit respondent coverage
+
+This cell measures how many respondents are available each year, how many have a usable mental-health outcome, whether their original annual weights are positive and finite, and how many states are represented. The audit takes place **before** excluding records with unknown FMD or race.
+
+```{r yearly-coverage}
+# Read the pooled 2014–2024 dataset without modifying the saved source file.
+historical <- read_historical()
+historical[, cohort := race_group(AIAN_ALONE)]
+
+# Tabulate survey availability by year.
+annual_audit <- historical[
+    ,
+    .(
+        respondents = .N,
+        valid_fmd = sum(valid_outcome(FMD)),
+        missing_fmd = sum(!valid_outcome(FMD)),
+        valid_weights = sum(valid_weight(RAW_WEIGHT)),
+        invalid_weights = sum(!valid_weight(RAW_WEIGHT)),
+        reporting_states = data.table::uniqueN(STATE)
+    ),
+    by = YEAR
+][order(YEAR)]
+
+annual_audit[
+    ,
+    missing_fmd_pct := 100 * missing_fmd / respondents
+]
+
+save_table(annual_audit, "01_yearly_audit")
+print(annual_audit)
+```
+
+## 3. Audit missing responses by year and population
+
+This cell checks whether unknown outcomes and selected missing predictors are distributed similarly across study populations. Missing **predictors** will later be retained as explicit `"Missing"` categories for modeling, but missing **FMD outcomes** cannot be classified as `0`.
+
+```{r response-missingness}
+# Recognize both true NA and the explicit Missing level used in this project.
+is_missing_response <- function(values) {
+    missing <- is.na(values)
+    labels <- as.character(values)
+    missing | (!missing & labels %in% c("", "Missing"))
+}
+
+# Count missing outcomes and selected predictor responses by year and cohort.
+missingness <- historical[
+    ,
+    .(
+        respondents = .N,
+        missing_fmd = sum(!valid_outcome(FMD)),
+        missing_income = sum(is_missing_response(INCOME_BAND)),
+        missing_general_health = sum(is_missing_response(GENHLTH_CLEAN)),
+        missing_physical_days = sum(is_missing_response(PHYSHLTH_DAYS))
+    ),
+    by = .(YEAR, cohort)
+][order(YEAR, cohort)]
+
+missingness[
+    ,
+    missing_fmd_pct := 100 * missing_fmd / respondents
+]
+
+save_table(missingness, "01_missingness_by_year_and_group")
+print(missingness)
+```
+
+## 4. Examine annual survey-weight distributions
+
+This measures how unequally the original **annual** weights are distributed. The Kish effective sample size is a *weight-only diagnostic*; it is **not** a full design-based effective sample size and should not be used as the denominator of a confidence interval.
+
+```{r annual-weights}
+# Summarize respondent weights before outcome-based exclusions.
+weight_audit <- historical[
+    valid_weight(RAW_WEIGHT),
+    .(
+        respondents = .N,
+        min_weight = min(RAW_WEIGHT),
+        median_weight = median(RAW_WEIGHT),
+        mean_weight = mean(RAW_WEIGHT),
+        max_weight = max(RAW_WEIGHT),
+        effective_n = sum(RAW_WEIGHT)^2 / sum(RAW_WEIGHT^2)
+    ),
+    by = YEAR
+][order(YEAR)]
+
+weight_audit[
+    ,
+    effective_n_pct := 100 * effective_n / respondents
+]
+
+save_table(weight_audit, "01_annual_weight_audit")
+print(weight_audit)
+```
+
+## 5. Compare weight-only effective sample sizes across populations
+
+This cell uses respondents with a valid FMD outcome to show how much weight inequality reduces the information available within each comparison group. It helps explain why AI/AN annual intervals may be wider despite thousands of survey responses.
+
+```{r group-weights}
+# Keep outcome-valid respondents in the two prespecified populations.
+valid_groups <- historical[
+    valid_outcome(FMD) &
+        valid_weight(RAW_WEIGHT) &
+        cohort %in% primary_groups
+]
+
+# Retain the counts required for prevalence-table interpretation.
+group_weight_audit <- valid_groups[
+    ,
+    .(
+        n = .N,
+        median_weight = median(RAW_WEIGHT),
+        max_weight = max(RAW_WEIGHT),
+        effective_n = sum(RAW_WEIGHT)^2 / sum(RAW_WEIGHT^2)
+    ),
+    by = .(YEAR, cohort)
+][order(YEAR, cohort)]
+
+group_weight_audit[
+    ,
+    effective_n_pct := 100 * effective_n / n
+]
+
+save_table(group_weight_audit, "01_group_weight_audit")
+print(group_weight_audit)
+```
+
+## 6. Verify the structure of the survey-design identifiers
+
+This cell checks the yearly sampling-stratum and PSU identifiers and verifies whether each `STRAT`–`PSU` combination is unique within its year. The revised variance calculation below uses **one public-use record per sampling unit** (`ids = ~1`), matching the 2024 structure you observed. If another year has repeated within-stratum PSU pairs, the notebook stops rather than silently imposing the wrong design.
+
+**This is a structural check only:** You must still verify the `RAW_WEIGHT`, `STRAT`, and `PSU` mappings against your CDC extraction code. One-respondent strata also require an explicit variance-adjustment rule.
+
+```{r survey-identifier-audit}
+# Count sampling identifiers within each survey year.
+design_audit <- historical[
+    ,
+    {
+        unique_pairs <- data.table::uniqueN(.SD, by = c("STRAT", "PSU"))
+
+        .(
+            respondents = .N,
+            unique_strata = data.table::uniqueN(STRAT),
+            unique_psu_values = data.table::uniqueN(PSU),
+            unique_stratum_psu_pairs = unique_pairs,
+            duplicated_stratum_psu_pairs = .N - unique_pairs,
+            missing_strata = sum(is.na(STRAT)),
+            missing_psus = sum(is.na(PSU))
+        )
+    },
+    by = YEAR,
+    .SDcols = c("STRAT", "PSU")
+][order(YEAR)]
+
+save_table(design_audit, "01_survey_identifier_audit")
+print(design_audit)
+
+# Halt if any year violates the one-record-per-pair assumption.
+if (any(design_audit$duplicated_stratum_psu_pairs > 0)) {
+    stop("Repeated stratum-PSU pairs found: verify the design before computing CIs.")
+}
+
+if (any(design_audit$missing_strata > 0 | design_audit$missing_psus > 0)) {
+    stop("Missing design identifiers found: resolve before computing CIs.")
+}
+```
+
+## 7. Detail the 2024 design diagnostic
+
+This replicates the 2024 check we discussed, including the number of strata containing only one respondent. The number of singleton strata matters because the `survey` package needs a documented method for estimating their variance contribution.
+
+```{r design-2024-details}
+# Count respondents per stratum and public-use PSU in 2024.
+records_2024 <- historical[YEAR == 2024]
+psu_pairs_2024 <- records_2024[
+    ,
+    .(respondents = .N),
+    by = .(STRAT, PSU)
+]
+
+strata_2024 <- psu_pairs_2024[
+    ,
+    .(psus_in_stratum = .N),
+    by = STRAT
+]
+
+design_summary_2024 <- data.table::data.table(
+    respondents = nrow(records_2024),
+    distinct_psu_values = data.table::uniqueN(records_2024$PSU),
+    distinct_stratum_psu_pairs = nrow(psu_pairs_2024),
+    multi_respondent_units = sum(psu_pairs_2024$respondents > 1),
+    singleton_strata = sum(strata_2024$psus_in_stratum == 1)
+)
+
+save_table(design_summary_2024, "01_survey_design_2024")
+print(design_summary_2024)
+```
+
+## 8. Estimate annual FMD prevalence and its 95% confidence intervals
+
+This is the **main descriptive analysis**. For each year from 2014 to 2024, the code first constructs a stratified survey design using **all records with usable annual weights**. Only *after* constructing the design does it subset to the two populations. Unknown mental-health outcomes are kept as `NA` and excluded by `na.rm = TRUE` when estimating prevalence.
+
+Annual point estimates use the year-specific `RAW_WEIGHT`, not a pooled multiyear weight. Standard errors and intervals account for the specified stratification and weights. The lonely-PSU adjustment is an approximation; results depend on correct original CDC variable mappings and preprocessing exclusions.
+
+```{r survey-prevalence-by-year}
+# Apply an explicit adjustment for strata or domains with one PSU.
+options(
+    survey.lonely.psu = "adjust",
+    survey.adjust.domain.lonely = TRUE
+)
+
+# Work one year at a time to avoid constructing a giant pooled survey object.
+prevalence_rows <- vector("list", length = 11L)
+gap_rows <- vector("list", length = 11L)
+analysis_years <- 2014:2024
+
+for (year_index in seq_along(analysis_years)) {
+    year <- analysis_years[year_index]
+    cat("[SURVEY] Estimating", year, "\n")
+
+    # Keep all source records with valid annual weights for the design.
+    data_year <- data.table::copy(
+        historical[YEAR == year & valid_weight(RAW_WEIGHT)]
+    )
+
+    # Preserve unknown FMD outcomes as missing, never as a negative response.
+    data_year[
+        ,
+        fmd_value := ifelse(valid_outcome(FMD), as.numeric(FMD), NA_real_)
+    ]
+
+    # Construct the full annual design before subgroup restriction.
+    annual_design <- survey::svydesign(
+        ids = ~1,
+        strata = ~STRAT,
+        weights = ~RAW_WEIGHT,
+        data = as.data.frame(data_year)
+    )
+
+    group_design <- subset(
+        annual_design,
+        cohort %in% primary_groups
+    )
+
+    # Estimate each group's prevalence and their joint covariance matrix.
+    group_estimates <- survey::svyby(
+        ~fmd_value,
+        ~cohort,
+        design = group_design,
+        FUN = survey::svymean,
+        na.rm = TRUE,
+        vartype = "se",
+        covmat = TRUE
+    )
+
+    # Match the named cohorts; never assume the result's row ordering.
+    observed_groups <- as.character(group_estimates$cohort)
+    group_indices <- match(primary_groups, observed_groups)
+
+    if (anyNA(group_indices)) {
+        stop("Missing one of the two study groups in survey year ", year)
+    }
+
+    estimates <- as.numeric(stats::coef(group_estimates))[group_indices]
+    covariance <- as.matrix(stats::vcov(group_estimates))[
+        group_indices,
+        group_indices,
+        drop = FALSE
+    ]
+
+    standard_errors <- sqrt(diag(covariance))
+    degrees_of_freedom <- survey::degf(group_design)
+    critical_value <- stats::qt(0.975, df = degrees_of_freedom)
+
+    # Group-specific annual prevalence and design-based confidence intervals.
+    prevalence_rows[[year_index]] <- data.table::data.table(
+        YEAR = year,
+        cohort = primary_groups,
+        observed_fmd = estimates,
+        se = standard_errors,
+        ci_l = estimates - critical_value * standard_errors,
+        ci_u = estimates + critical_value * standard_errors,
+        degrees_of_freedom = degrees_of_freedom
+    )
+
+    # Directly estimate the AI/AN minus comparison prevalence difference.
+    contrast <- c(1, -1)
+    difference <- sum(contrast * estimates)
+    difference_se <- sqrt(
+        as.numeric(t(contrast) %*% covariance %*% contrast)
+    )
+
+    gap_rows[[year_index]] <- data.table::data.table(
+        YEAR = year,
+        gap_pp = 100 * difference,
+        se_pp = 100 * difference_se,
+        ci_l_pp = 100 * (difference - critical_value * difference_se),
+        ci_u_pp = 100 * (difference + critical_value * difference_se),
+        degrees_of_freedom = degrees_of_freedom
+    )
+
+    # Release large design objects before processing the next survey year.
+    rm(data_year, annual_design, group_design, group_estimates)
+}
+
+annual_prevalence <- data.table::rbindlist(prevalence_rows)
+annual_gap <- data.table::rbindlist(gap_rows)
+
+# Join respondent counts and weight-only effective n to each group estimate.
+annual_prevalence <- merge(
+    annual_prevalence,
+    group_weight_audit[, .(YEAR, cohort, n, effective_n, effective_n_pct)],
+    by = c("YEAR", "cohort"),
+    all.x = TRUE,
+    sort = FALSE
+)
+
+data.table::setorder(annual_prevalence, YEAR, cohort)
+data.table::setorder(annual_gap, YEAR)
+
+# Store the exact values that appear in the two figures.
+save_table(annual_prevalence, "01_annual_fmd_prevalence")
+save_table(annual_gap, "01_annual_fmd_gap")
+
+print(annual_prevalence)
+print(annual_gap)
+```
+
+## 9. Figure 1 — Annual FMD prevalence with confidence intervals
+
+**What it measures:** the estimated proportion reporting frequent mental distress in each year, separately for the two populations. The shaded ribbons are **95% design-based confidence intervals**, not individual prediction intervals. A higher line does not reveal what caused the difference.
+
+```{r annual-prevalence-figure, fig.width=11, fig.height=6}
+# Plot annual estimates and group-specific uncertainty ribbons.
+prevalence_plot <- ggplot2::ggplot(
+    annual_prevalence,
+    ggplot2::aes(
+        x = YEAR,
+        y = observed_fmd,
+        color = cohort,
+        group = cohort
+    )
+) +
+    ggplot2::geom_ribbon(
+        ggplot2::aes(ymin = ci_l, ymax = ci_u, fill = cohort),
+        alpha = 0.16,
+        color = NA
+    ) +
+    ggplot2::geom_line(linewidth = 1.1) +
+    ggplot2::geom_point(size = 2.5) +
+    ggplot2::scale_x_continuous(breaks = 2014:2024) +
+    ggplot2::scale_y_continuous(
+        breaks = seq(0, 0.30, by = 0.05),
+        labels = scales::percent_format(accuracy = 1),
+        expand = ggplot2::expansion(mult = c(0, 0.03))
+    ) +
+    ggplot2::coord_cartesian(
+        ylim = c(0, max(annual_prevalence$ci_u, na.rm = TRUE) * 1.06)
+    ) +
+    atg_scale_color_groups() +
+    atg_scale_fill_groups() +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Frequent mental distress, 2014–2024",
+        subtitle = "Survey-weighted annual prevalence with 95% confidence intervals",
+        x = "BRFSS survey year",
+        y = "Adults reporting frequent mental distress",
+        color = "Population",
+        fill = "Population",
+        caption = paste(
+            "FMD = 14+ mentally unhealthy days in the past 30 days.",
+            "Annual cross-sectional estimates; reporting states vary by year.",
+            "Intervals depend on verified BRFSS design-variable mappings."
+        )
+    )
+
+# Print the chart inside this notebook and save it with the current run suffix.
+show_and_save(prevalence_plot, "01_annual_fmd_prevalence", 11, 6)
+```
+
+## 10. Figure 2 — Annual AI/AN prevalence difference with confidence intervals
+
+**What it measures:** the percentage-point difference between AI/AN-alone and other single-race annual FMD prevalence. Positive values mean higher estimated prevalence among AI/AN-alone adults; an interval spanning zero indicates that the difference is not distinguishable from zero at the 95% confidence level under the specified design. This is a *difference of prevalence*, **not** a difference in model accuracy.
+
+```{r annual-gap-figure, fig.width=11, fig.height=5}
+# Plot the annual group contrast with its directly calculated standard error.
+gap_plot <- ggplot2::ggplot(
+    annual_gap,
+    ggplot2::aes(x = YEAR, y = gap_pp)
+) +
+    ggplot2::geom_hline(
+        yintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["gold"]],
+        linewidth = 0.6
+    ) +
+    ggplot2::geom_errorbar(
+        ggplot2::aes(ymin = ci_l_pp, ymax = ci_u_pp),
+        width = 0.18,
+        linewidth = 0.65,
+        color = atg_palette[["turquoise"]]
+    ) +
+    ggplot2::geom_line(color = atg_palette[["turquoise"]], linewidth = 1.1) +
+    ggplot2::geom_point(color = atg_palette[["turquoise"]], size = 2.5) +
+    ggplot2::scale_x_continuous(breaks = 2014:2024) +
+    ggplot2::scale_y_continuous(
+        labels = function(values) paste0(round(values, 1), " pp")
+    ) +
+    atg_theme() +
+    ggplot2::labs(
+        title = "AI/AN versus comparison prevalence gap, 2014–2024",
+        subtitle = "AI/AN alone minus other identified single-race adults",
+        x = "BRFSS survey year",
+        y = "Difference in prevalence (percentage points)",
+        caption = paste(
+            "Error bars show 95% survey-design confidence intervals",
+            "for the difference, not separate group intervals.",
+            "The zero line means no difference."
+        )
+    )
+
+# Show the plot inline and save a numbered copy with the current run.
+show_and_save(gap_plot, "01_annual_fmd_gap", 11, 5)
+```
+
+## 11. Check the 2024 result and record interpretation
+
+Highlights the same 2024 calculation. It should reproduce approximately **21.35%** AI/AN prevalence, **15.19%** comparison prevalence, and **+6.16 percentage points** with a **95% CI around +4.03 to +8.30 points**, assuming the data and design settings are unchanged. The check prints the numbers from this run rather than inserting hard-coded results into any chart.
+
+```{r check-2024}
+# Display 2024 subgroup estimates and the direct between-group contrast.
+comparison_2024 <- annual_prevalence[
+    YEAR == 2024,
+    .(
+        cohort,
+        respondents = n,
+        prevalence_pct = round(100 * observed_fmd, 2),
+        ci_lower_pct = round(100 * ci_l, 2),
+        ci_upper_pct = round(100 * ci_u, 2),
+        effective_n = round(effective_n)
+    )
+]
+
+gap_2024 <- annual_gap[
+    YEAR == 2024,
+    .(
+        difference_pp = round(gap_pp, 2),
+        ci_lower_pp = round(ci_l_pp, 2),
+        ci_upper_pp = round(ci_u_pp, 2)
+    )
+]
+
+cat("\n[2024] Population-specific prevalence and 95% intervals\n")
+print(comparison_2024)
+
+cat("\n[2024] AI/AN-minus-comparison difference (percentage points)\n")
+print(gap_2024)
+```
+
+## Interpretation and limitations
+
+- **Population estimates, not predictions:** This notebook describes trends in *reported* FMD, whereas later notebooks test out-of-time predictive classification.
+- **Race definition:** "AI/AN alone" excludes multiracial AI/AN respondents; "other identified single-race" is not the whole U.S. population.
+- **Missing outcomes:** An unanswered FMD question is not a negative response. Missing responses remain visible in the audit and are omitted from prevalence estimation.
+- **Sampling design:** The variance calculations require verified CDC source mappings, accurate retained stratum identifiers, and a documented handling of singleton strata. They do not correct potential nonresponse bias or all differences in survey coverage.
+- **Annual geography:** States participating in BRFSS differ across years. These annual estimates do not by themselves establish a causal trend or isolate changes in geographic composition.
+- **Effective sample size:** The reported Kish values describe unequal weights, not the complete survey-design effective sample sizes.
+- **Run increments:** This notebook inherits the active increment when run from the master and allocates a fresh increment when knitted independently. Existing files are never silently overwritten.

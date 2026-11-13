@@ -1,0 +1,225 @@
+---
+title: "04 — Develop models using earlier years only"
+output: html_notebook
+---
+
+**Measures:** out-of-time model discrimination (weighted AUROC) and probability error (weighted Brier score) on annual forward-validation folds. Models never train on the same or a later year than their fold assessment.
+
+
+## Setup
+
+Loads the unchanged input settings, shared model functions, and the persistent run
+increment. The output suffix identifies this run.
+
+```{r setup}
+# Set the project root, then load R code from the shared R Notebooks.
+
+# -----------------------------------------------------------------------------
+# Project-root discovery
+# -----------------------------------------------------------------------------
+
+# Search upward for the project marker so notebook paths do not depend on a particular
+# subfolder.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    # Walk toward the filesystem root until the project marker is found.
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        # Move up one directory; an unchanged parent marks the filesystem root.
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+
+# -----------------------------------------------------------------------------
+# Notebook execution root
+# -----------------------------------------------------------------------------
+
+# Resolve the project before loading modules; configure subsequent knitr chunks to use
+# that root.
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+
+# -----------------------------------------------------------------------------
+# Shared-module loader
+# -----------------------------------------------------------------------------
+
+# Extract R chunks in source order and evaluate them in the caller environment.
+# This lightweight loader does not process chunk options such as eval = FALSE.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        # Use the next standalone closing fence for this R chunk.
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Shared settings and utilities
+# -----------------------------------------------------------------------------
+
+# Load configuration before helpers, retaining the existing presentation palette module.
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+
+# -----------------------------------------------------------------------------
+# Existing-run attachment
+# -----------------------------------------------------------------------------
+
+# Attach to an allocated run rather than incrementing the counter in this stage.
+run_context <- attach_run()
+cat("[RUN] Current increment:", run_context$id, "\n")
+```
+
+
+## Evaluate forward validation folds
+
+Compares weighted logistic regression, LASSO logistic regression, and random forest. The
+best tuning setting for each family is chosen by the mean Brier score over validation
+years.
+
+```{r evaluate-forward-validation-folds}
+# -----------------------------------------------------------------------------
+# Forward-year model development
+# -----------------------------------------------------------------------------
+
+# Train on years strictly earlier than each assessment year.
+# Compare tuning settings using mean fold Brier error, without using 2023–2025 outcomes
+# here.
+
+check_packages(c("glmnet", "ranger", "Matrix"))
+training <- load_run_rds("checkpoints", "02_development")
+settings <- list(
+    logistic = NA_real_,
+    lasso = lasso_lambdas,
+    forest = forest_mtry
+)
+results <- list()
+index <- 0L
+
+
+# Iterate through the configured analysis items in the original execution order.
+for (year in cv_test_years) {
+    # Exclude the assessment year and all later years from this fold training set.
+    earlier <- training[YEAR < year]
+    # Evaluate only the held-out survey year for this fold.
+    assessment <- training[YEAR == year]
+    if (!nrow(earlier) || !nrow(assessment)) {
+        stop("Empty forward-validation fold for ", year)
+    }
+    cat("[TEMPORAL CV] Training before ", year, "; evaluating ", year, "\n", sep = "")
+
+    for (family in names(settings)) {
+        for (parameter in settings[[family]]) {
+            index <- index + 1L
+            set.seed(seed + year + index)
+            fitted <- fit_classifier(family, earlier, parameter)
+            probabilities <- predict_classifier(fitted, assessment)
+            measurements <- weighted_metrics(
+                assessment$FMD, probabilities, assessment$train_weight
+            )
+            results[[index]] <- data.frame(
+                assessment_year = year,
+                family = family,
+                setting = if (is.na(parameter)) "default" else as.character(parameter),
+                measurements
+            )
+            rm(fitted)
+            gc(verbose = FALSE)
+        }
+    }
+}
+all_folds <- data.table::rbindlist(results)
+summary <- all_folds[, .(
+    folds = .N,
+    mean_brier = mean(brier),
+    mean_auc = mean(auc, na.rm = TRUE)
+), by = .(family, setting)][order(mean_brier)]
+# Select the lowest mean Brier error separately within each model family.
+chosen <- summary[, .SD[which.min(mean_brier)], by = family]
+
+if (any(!is.finite(chosen$mean_brier))) {
+    stop("Temporal validation returned invalid model selection scores")
+}
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(all_folds, "04_annual_forward_folds")
+save_table(summary, "04_tuning_summary")
+save_table(chosen, "04_chosen_settings")
+
+# Persist this run-specific object for downstream stages without intentionally
+# overwriting an existing artifact.
+save_once_rds(
+    stats::setNames(as.list(chosen$setting), chosen$family),
+    "checkpoints",
+    "04_tuning"
+)
+print(summary)
+```
+
+
+## Visualize out-of-time performance
+
+Displays the AUROC achieved for each model family on each held-out historical year. A
+lower value means poorer classification discrimination, not necessarily a higher
+false-negative rate at every threshold.
+
+```{r visualize-out-of-time-performance}
+# -----------------------------------------------------------------------------
+# Selected tuning settings across folds
+# -----------------------------------------------------------------------------
+
+# Restrict the display to the chosen setting within each model family.
+# The plotted fold results also informed tuning; they are not a separate final test.
+
+# Plot only the eventual tuning winner for each family in each fold.
+plot_data <- merge(
+    all_folds[, .(assessment_year, family, setting, auc)],
+    chosen[, .(family, setting)],
+    by = c("family", "setting")
+)
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+
+# Build the chart using the existing palette and theme; retain the original scales and
+# labels.
+plot <- ggplot2::ggplot(
+    plot_data,
+    ggplot2::aes(assessment_year, auc, color = family)
+) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point() +
+    atg_scale_color_models() +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Forward-year model discrimination",
+        subtitle = "Development years only; higher weighted AUROC is better",
+        x = "Held-out survey year",
+        y = "Survey-weighted AUROC",
+        color = "Model"
+    )
+show_and_save(plot, "04_forward_auroc", 9, 5)
+```

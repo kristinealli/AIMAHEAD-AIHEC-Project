@@ -1,0 +1,936 @@
+---
+title: "21 — Expanded AI/AN models: logistic regression, LASSO, random forest"
+subtitle: "2023 model fitting | 2024 selection and intercept recalibration | 2025 exploratory evaluation"
+output: html_notebook
+---
+
+## Purpose and study design
+
+**Question:** When we use a broader set of physical-health, healthcare-access, functional-health, socioeconomic, and demographic characteristics, how well can three supervised classifiers identify *frequent mental distress* (FMD) among AI/AN-alone BRFSS respondents?
+
+This notebook is a **separate experiment**. It does not replace or change the models from run 0017, Notebook 19, or the exploratory Notebook 20. It uses `aian_all_variables_2023_2025.rds` and includes **only the AI/AN subset supplied in that source file**. Check the cohort audit against CDC race definitions; this notebook does not independently establish Tribal citizenship or verify the source's race-selection rule.
+
+- **2023:** Fit logistic regression, LASSO logistic regression, and random forest using the same selected predictors and outcome observations. Select the LASSO penalty with cross-validation *inside 2023*.
+- **2024:** Compare the three fitted models using the survey-weighted Brier score and select one. Fit a simple probability-intercept adjustment separately for each model, using only 2024 data. 2024 is a *model selection and recalibration* year, not an independent final test.
+- **2025:** Evaluate all three frozen models on the exact same AI/AN respondents, including AUROC, Brier score, average predicted prevalence, ROC curves, and confusion matrices at 0.16, 0.20, and 0.50 thresholds.
+
+**Important boundaries:** FMD is `MENTHLTH >= 14` days of poor mental health during the preceding 30 days; `MENTHLTH=88` means **zero** days, while 77/99/unexpected values are missing. Predictors measured during that same period (especially physically unhealthy days) are contemporaneous associations, not advance warnings of future distress. No mental-health outcome/diagnosis, depression, substance use, race field, geographic ID, or survey weight is used **as a model feature**. These exclusions reflect this study's specific non-stigmatizing scope, not a judgment about whether other variables can be useful in other contexts. Given earlier inspection of 2025 results, **all new 2025 comparisons are exploratory/post-hoc**, rather than a newly blinded validation.
+
+Model fitting uses survey weights rescaled to mean one as *pseudo-weights*; evaluation uses the original BRFSS weights for descriptive point estimates. These calculations **do not provide full complex-survey inference** or confidence intervals. Adding predictors and switching to single-year AI/AN-only training together means any comparison with prior multiyear/six-feature models will **not isolate which change caused a difference**.
+
+## 1 — Setup, input, and study audit
+
+```{r setup}
+find_project_root <- function(start = getwd()) {
+  current <- normalizePath(start, mustWork = TRUE)
+  repeat {
+    if (file.exists(file.path(current, "FMD_Project.Rproj"))) return(current)
+    parent <- dirname(current)
+    if (identical(parent, current)) {
+      stop("Open FMD_Project.Rproj in RStudio before running Notebook 21.")
+    }
+    current <- parent
+  }
+}
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+needed_packages <- c("data.table", "ggplot2", "scales", "glmnet", "ranger")
+for (pkg in needed_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop("Missing R package: ", pkg, ". Install it before knitting Notebook 21.")
+  }
+}
+set.seed(42L)
+
+# Do not alter Notebook 20 or run-0017 artifacts.
+output_root <- file.path(project_root, "outputs", "21_aian_expanded_three_models_2023_2025")
+table_dir <- file.path(output_root, "tables")
+figure_dir <- file.path(output_root, "figures")
+model_dir <- file.path(output_root, "models")
+for (folder in c(table_dir, figure_dir, model_dir)) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+}
+write_table_21 <- function(x, stem) {
+  filename <- file.path(table_dir, paste0(stem, ".csv"))
+  data.table::fwrite(x, filename)
+  cat("[TABLE]", filename, "\n")
+}
+write_plot_21 <- function(plot, stem, width = 10, height = 6) {
+  print(plot)
+  filename <- file.path(figure_dir, paste0(stem, ".png"))
+  ggplot2::ggsave(filename, plot, width = width, height = height,
+                  bg = "white", dpi = 200)
+  cat("[FIGURE]", filename, "\n")
+}
+colors_21 <- c("Logistic regression" = "#AF6D46",
+               "LASSO" = "#C69A51", "Random forest" = "#319F98")
+plot_theme_21 <- function() {
+  ggplot2::theme_minimal(base_size = 12) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", color = "#584435"),
+      plot.subtitle = ggplot2::element_text(color = "#AF6D46"),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = "bottom"
+    )
+}
+weighted_mean_21 <- function(x, w) {
+  keep <- !is.na(x) & is.finite(x) & is.finite(w) & w > 0
+  if (!any(keep)) return(NA_real_)
+  sum(x[keep] * w[keep]) / sum(w[keep])
+}
+
+source_candidates <- c(
+  file.path(project_root, "data", "processed", "aian_all_variables_2023_2025.rds"),
+  file.path(project_root, "processed", "aian_all_variables_2023_2025.rds")
+)
+source_paths <- source_candidates[file.exists(source_candidates)]
+if (!length(source_paths)) {
+  stop("Cannot find aian_all_variables_2023_2025.rds in data/processed or processed.")
+}
+source_path <- source_paths[[1]]
+source_checksum <- unname(tools::md5sum(source_path))
+raw <- data.table::as.data.table(readRDS(source_path))
+required_source <- c("YEAR", "_LLCPWT", "MENTHLTH", "GENHLTH", "PHYSHLTH")
+missing_source <- setdiff(required_source, names(raw))
+if (length(missing_source)) {
+  stop("Required source variables missing: ", paste(missing_source, collapse = ", "))
+}
+raw[, YEAR := as.integer(YEAR)]
+if (!identical(sort(unique(raw$YEAR)), 2023:2025)) {
+  stop("Expected exactly 2023, 2024, 2025; found: ",
+       paste(sort(unique(raw$YEAR)), collapse = ", "))
+}
+raw[, RAW_WEIGHT := suppressWarnings(as.numeric(get("_LLCPWT")))]
+if (any(!is.finite(raw$RAW_WEIGHT) | raw$RAW_WEIGHT <= 0)) {
+  stop("Invalid source survey weights; inspect the source file before modeling.")
+}
+# MENTHLTH 88 = zero days; values 1:30 are days; 77/99 are missing.
+mental_code <- suppressWarnings(as.numeric(raw$MENTHLTH))
+mental_days <- rep(NA_real_, length(mental_code))
+mental_days[!is.na(mental_code) & mental_code == 88] <- 0
+valid_day <- !is.na(mental_code) & mental_code >= 1 & mental_code <= 30
+mental_days[valid_day] <- mental_code[valid_day]
+raw[, FMD := as.integer(mental_days >= 14)]
+raw[is.na(mental_days), FMD := NA_integer_]
+
+source_audit <- raw[, .(
+  respondents = .N,
+  valid_outcome_n = sum(!is.na(FMD)),
+  FMD_count = sum(FMD == 1L, na.rm = TRUE),
+  weighted_FMD_prevalence_pct = 100 * weighted_mean_21(FMD, RAW_WEIGHT)
+), by = YEAR][order(YEAR)]
+write_table_21(source_audit, "21_source_and_outcome_audit")
+print(source_audit)
+cat("[SOURCE]", source_path, "\n[MD5]", source_checksum, "\n")
+for (race_name in intersect(c("_MRACE1", "_RACE"), names(raw))) {
+  race_tab <- raw[, .N, by = .(YEAR, code = as.character(get(race_name)))][order(YEAR, -N)]
+  write_table_21(race_tab, paste0("21_source_race_audit_", gsub("^_", "", race_name)))
+  cat("[RACE CHECK]", race_name, "\n")
+  print(race_tab[, head(.SD, 6L), by = YEAR])
+}
+```
+
+## 2 — Prespecify and audit the expanded predictors
+
+We start with the same explicit raw-variable coding decisions as the expanded Notebook 20. Food assistance is *not* included because its year-specific coverage was too low in the previous audit. All predictor selection and imputation parameters are fitted using **2023 training data only**. Unknown, refused, or unsupported codes are missing, never treated as numeric scores. `EMPLOY1=7` and `CHECKUP1=8`, for example, remain valid responses because their categories are variable-specific.
+
+```{r feature-dictionary}
+feature_21 <- function(source, label, domain, allowed, kind = "categorical") {
+  list(source = source, label = label, domain = domain,
+       allowed = allowed, kind = kind)
+}
+feature_specs <- list(
+  feature_21("GENHLTH", "General health", "Physical health", 1:5),
+  feature_21("PHYSHLTH", "Physically unhealthy days", "Physical health", 0:30, "days"),
+  feature_21("_AGEG5YR", "Age group", "Demographics", 1:13),
+  feature_21("SEXVAR", "Sex", "Demographics", 1:2),
+  feature_21("EDUCA", "Education", "Socioeconomic", 1:6),
+  feature_21("INCOME3", "Household income", "Socioeconomic", 1:11),
+  feature_21("EMPLOY1", "Employment", "Socioeconomic", 1:8),
+  feature_21("RENTHOM1", "Home tenure", "Socioeconomic", 1:3),
+  feature_21("PERSDOC3", "Has personal healthcare provider", "Healthcare access", 1:3),
+  feature_21("MEDCOST1", "Could not afford medical care", "Healthcare access", 1:2),
+  feature_21("CHECKUP1", "Time since routine checkup", "Healthcare access", c(1:4, 8)),
+  feature_21("EXERANY2", "Exercise in past 30 days", "Health activity", 1:2),
+  feature_21("DIFFWALK", "Difficulty walking", "Functional health", 1:2),
+  feature_21("DIFFDRES", "Difficulty dressing", "Functional health", 1:2),
+  feature_21("DIFFALON", "Difficulty doing errands alone", "Functional health", 1:2),
+  feature_21("DEAF", "Deaf or serious hearing difficulty", "Functional health", 1:2),
+  feature_21("BLIND", "Blind or serious visual difficulty", "Functional health", 1:2),
+  feature_21("ASTHMA3", "Ever diagnosed with asthma", "Chronic conditions", 1:2),
+  feature_21("CVDINFR4", "Heart attack history", "Chronic conditions", 1:2),
+  feature_21("CVDCRHD4", "Coronary heart disease history", "Chronic conditions", 1:2),
+  feature_21("CVDSTRK3", "Stroke history", "Chronic conditions", 1:2),
+  feature_21("CHCCOPD3", "COPD history", "Chronic conditions", 1:2),
+  feature_21("CHCKDNY2", "Kidney disease history", "Chronic conditions", 1:2),
+  feature_21("HAVARTH4", "Arthritis history", "Chronic conditions", 1:2),
+  feature_21("DIABETE4", "Diabetes status", "Chronic conditions", 1:4)
+)
+
+clean_feature_21 <- function(d, s) {
+  if (!(s$source %in% names(d))) return(rep(NA_real_, nrow(d)))
+  x <- suppressWarnings(as.numeric(d[[s$source]]))
+  if (identical(s$kind, "days")) {
+    x[!is.na(x) & x == 88] <- 0
+  }
+  x[is.na(x) | !(x %in% s$allowed)] <- NA_real_
+  x
+}
+# Readable safe column names, with raw BRFSS codes recorded separately.
+feat_names <- make.names(vapply(feature_specs, `[[`, "", "label"), unique = TRUE)
+feature_dictionary <- data.table::rbindlist(lapply(seq_along(feature_specs), function(i) {
+  s <- feature_specs[[i]]
+  data.table::data.table(source = s$source, feature = s$label,
+    encoded_name = feat_names[i], domain = s$domain, kind = s$kind,
+    allowed_codes = paste(s$allowed, collapse = ","), exists = s$source %in% names(raw))
+}))
+write_table_21(feature_dictionary, "21_feature_dictionary")
+print(feature_dictionary)
+
+original_values <- lapply(feature_specs, function(s) clean_feature_21(raw, s))
+coverage <- data.table::rbindlist(lapply(seq_along(feature_specs), function(i) {
+  data.table::data.table(
+    YEAR = raw$YEAR, observed = !is.na(original_values[[i]])
+  )[, .(valid_n = sum(observed), records = .N,
+         coverage_pct = 100 * mean(observed)), by = YEAR][,
+      `:=`(source = feature_specs[[i]]$source,
+           feature = feature_specs[[i]]$label,
+           encoded_name = feat_names[i])]
+}))
+write_table_21(coverage, "21_feature_coverage_by_year")
+training_coverage <- coverage[YEAR == 2023L]
+training_coverage[, training_distinct_codes := vapply(source,
+  function(src) {
+    i <- match(src, vapply(feature_specs, `[[`, "", "source"))
+    data.table::uniqueN(original_values[[i]][raw$YEAR == 2023L], na.rm = TRUE)
+  }, integer(1))]
+training_coverage[, retained := coverage_pct >= 75 & training_distinct_codes >= 2]
+training_coverage[, reason := ifelse(retained, "Retained",
+  "Less than 75% valid in 2023 or fewer than 2 observed codes")]
+write_table_21(training_coverage, "21_2023_feature_selection")
+print(training_coverage[, .(source, feature, coverage_pct, training_distinct_codes, retained)])
+
+selected_indices <- which(training_coverage$retained)
+# 2023 model fitting must retain the original six domains at minimum.
+core_sources <- c("GENHLTH", "PHYSHLTH", "_AGEG5YR", "SEXVAR", "EDUCA", "INCOME3")
+if (!all(core_sources %in% feature_dictionary$source[selected_indices])) {
+  stop("Missing a core source predictor. Review 2023 feature coding and coverage.")
+}
+selected_specs <- feature_specs[selected_indices]
+selected_names <- feat_names[selected_indices]
+cat("[FEATURE SELECTION]", length(selected_specs), "of", length(feature_specs),
+    "prespecified predictor groups retained.\n")
+```
+
+## 3 — Transform predictors using training-year information only
+
+Missing numeric days are imputed using the **2023 median**. Missing categorical values are imputed with their **2023 mode**. A response code first encountered in 2024/2025 is handled as unseen and mapped to the 2023 mode. Categorical codes are converted into *factors*, avoiding the false assumption that code 5 is five times code 1. Day counts are standardized with **2023 mean/SD**, then clipped to ±3 training standard deviations to bound extreme values. Missingness and unseen codes are audited. These are pragmatic exploratory preprocessing decisions; missingness may carry its own predictive information.
+
+```{r prepare-features}
+analysis <- data.table::copy(raw[, .(YEAR, RAW_WEIGHT, FMD)])
+training_mask <- raw$YEAR == 2023L
+most_common_21 <- function(x) {
+  v <- x[!is.na(x)]
+  if (!length(v)) stop("No observed training values for a selected feature.")
+  as.numeric(names(sort(table(v), decreasing = TRUE)[1L]))
+}
+preprocess_params <- list()
+missing_audit <- list()
+for (j in seq_along(selected_indices)) {
+  idx <- selected_indices[j]
+  s <- feature_specs[[idx]]
+  nm <- feat_names[idx]
+  x <- original_values[[idx]]
+  x_train <- x[training_mask]
+  train_levels <- sort(unique(x_train[!is.na(x_train)]))
+  replacement <- if (identical(s$kind, "days")) {
+    stats::median(x_train, na.rm = TRUE)
+  } else most_common_21(x_train)
+  was_missing <- is.na(x)
+  was_unseen <- !is.na(x) & !(x %in% train_levels)
+  x[was_missing | was_unseen] <- replacement
+
+  if (identical(s$kind, "days")) {
+    mu <- mean(x[training_mask])
+    sigma <- stats::sd(x[training_mask])
+    if (!is.finite(sigma) || sigma <= 0) stop("Zero/invalid training SD for ", nm)
+    x_final <- pmax(-3, pmin(3, (x - mu) / sigma))
+  } else {
+    mu <- NA_real_
+    sigma <- NA_real_
+    x_final <- factor(paste0("code_", x), levels = paste0("code_", train_levels))
+  }
+  analysis[, (nm) := x_final]
+  preprocess_params[[nm]] <- list(source = s$source, kind = s$kind,
+    train_levels = train_levels, replacement = replacement,
+    mean_2023 = mu, sd_2023 = sigma)
+  missing_audit[[j]] <- data.table::data.table(
+    YEAR = sort(unique(raw$YEAR)), feature = s$label, source = s$source,
+    originally_missing_n = vapply(sort(unique(raw$YEAR)), function(yr)
+      sum(was_missing[raw$YEAR == yr]), integer(1)),
+    unseen_code_n = vapply(sort(unique(raw$YEAR)), function(yr)
+      sum(was_unseen[raw$YEAR == yr]), integer(1))
+  )
+}
+write_table_21(data.table::rbindlist(missing_audit), "21_imputation_and_unseen_codes")
+
+# Restrict all three models and both evaluation years to valid binary FMD outcomes.
+train <- analysis[YEAR == 2023L & !is.na(FMD)]
+valid <- analysis[YEAR == 2024L & !is.na(FMD)]
+test <- analysis[YEAR == 2025L & !is.na(FMD)]
+for (d in list(train, valid, test)) {
+  if (!identical(sort(unique(d$FMD)), 0:1)) stop("An analysis year lacks an outcome class.")
+}
+get_features <- function(d) as.data.frame(d[, ..selected_names])
+train_df <- get_features(train)
+valid_df <- get_features(valid)
+test_df <- get_features(test)
+
+# Identical model-matrix columns across years, derived from 2023 factor levels.
+mm_formula <- stats::as.formula("~ .")
+model_matrix <- function(df) {
+  m <- stats::model.matrix(mm_formula, data = df)
+  m <- m[, colnames(m) != "(Intercept)", drop = FALSE]
+  storage.mode(m) <- "double"
+  m
+}
+X_train <- model_matrix(train_df)
+X_valid <- model_matrix(valid_df)
+X_test <- model_matrix(test_df)
+if (!identical(colnames(X_train), colnames(X_valid)) ||
+    !identical(colnames(X_train), colnames(X_test))) {
+  stop("Model matrix columns differ across years; check factor levels.")
+}
+if (!all(is.finite(X_train)) || !all(is.finite(X_valid)) || !all(is.finite(X_test))) {
+  stop("Unexpected missing or invalid encoded predictors.")
+}
+# Survey pseudo-weights, normalized to have mean 1 within each year's outcome sample.
+scale_weights_21 <- function(w) w / mean(w)
+train_weights <- scale_weights_21(train$RAW_WEIGHT)
+valid_weights <- scale_weights_21(valid$RAW_WEIGHT)
+
+sample_counts <- data.table::rbindlist(lapply(list(train=train, valid=valid, test=test), function(d) {
+  data.table::data.table(n = nrow(d), FMD_n = sum(d$FMD == 1L),
+    prevalence_pct = 100 * weighted_mean_21(d$FMD, d$RAW_WEIGHT),
+    effective_n_kish = sum(d$RAW_WEIGHT)^2 / sum(d$RAW_WEIGHT^2))
+}), idcol = "split")
+write_table_21(sample_counts, "21_modeling_samples")
+print(sample_counts)
+cat("[ENCODED]", ncol(X_train), "model-matrix columns for",
+    length(selected_specs), "predictor groups.\n")
+```
+
+## 4 — Fit three classifiers on 2023 AI/AN respondents
+
+All classifiers are trained on the same 2023 outcome records and features. LASSO's penalty is selected with **five-fold stratified cross-validation within 2023**; the 2024 and 2025 outcomes are not used to tune that penalty. Random-forest settings are fixed in advance for this experiment, not tuned on 2025.
+
+```{r fit-three-models}
+set.seed(42L)
+
+# 1: Standard logistic regression.
+glm_frame <- data.frame(FMD = as.integer(train$FMD), train_df,
+                        check.names = FALSE)
+logistic_fit <- stats::glm(
+  FMD ~ ., data = glm_frame, weights = train_weights,
+  family = stats::binomial(),
+  control = stats::glm.control(maxit = 100, epsilon = 1e-8)
+)
+if (!isTRUE(logistic_fit$converged)) {
+  warning("Logistic regression did not fully converge; examine fit before interpreting results.")
+}
+
+# 2: LASSO (L1-penalized logistic regression) with within-2023 stratified folds.
+set.seed(43L)
+fold_id <- integer(nrow(train))
+for (cl in c(0L, 1L)) {
+  ix <- which(train$FMD == cl)
+  fold_id[ix] <- sample(rep(seq_len(5L), length.out = length(ix)))
+}
+lasso_cv <- glmnet::cv.glmnet(
+  x = X_train, y = train$FMD, weights = train_weights,
+  family = "binomial", alpha = 1, foldid = fold_id,
+  type.measure = "mse", standardize = TRUE,
+  nlambda = 80
+)
+# Conservative lambda.1se keeps the model relatively sparse.
+lasso_lambda <- lasso_cv$lambda.1se
+
+# 3: Random forest, using the raw factor domains instead of one-hot columns.
+rf_train <- data.frame(
+  FMD_class = factor(ifelse(train$FMD == 1L, "FMD", "No_FMD"),
+                     levels = c("No_FMD", "FMD")),
+  train_df, check.names = FALSE
+)
+set.seed(44L)
+forest_fit <- ranger::ranger(
+  formula = FMD_class ~ ., data = rf_train, probability = TRUE,
+  num.trees = 400L,
+  mtry = max(2L, floor(sqrt(length(selected_names)))),
+  min.node.size = 50L, splitrule = "gini",
+  case.weights = train_weights,
+  importance = "permutation", seed = 44L, num.threads = 2L
+)
+
+saveRDS(list(fit = logistic_fit, feature_names = selected_names),
+        file.path(model_dir, "21_logistic_2023.rds"))
+saveRDS(list(fit = lasso_cv, lambda_1se = lasso_lambda),
+        file.path(model_dir, "21_lasso_2023.rds"))
+saveRDS(forest_fit, file.path(model_dir, "21_random_forest_2023.rds"))
+saveRDS(list(selected_specs = selected_specs, selected_names = selected_names,
+             preprocessing = preprocess_params, model_matrix_columns = colnames(X_train),
+             source_md5 = source_checksum),
+        file.path(model_dir, "21_2023_preprocessing.rds"))
+
+fit_audit <- data.table::data.table(
+  model = c("Logistic regression", "LASSO", "Random forest"),
+  detail = c(
+    paste("GLM convergence:", logistic_fit$converged),
+    paste("LASSO lambda.1se:", format(lasso_lambda, digits = 6)),
+    paste("Trees:", forest_fit$num.trees)
+  )
+)
+write_table_21(fit_audit, "21_model_fit_audit")
+print(fit_audit)
+```
+
+## 5 — 2024 performance and model selection
+
+Compare **raw 2024 predicted probabilities**. Choose the model with the **lowest survey-weighted Brier score**. Discrimination (AUROC) is reported as context. This 2024 selection stage is explicitly exploratory: the national model from run 0017 used a different historical training strategy.
+
+```{r validation-and-selection}
+clip_probability <- function(p, eps = 1e-6) {
+  pmax(eps, pmin(1 - eps, as.numeric(p)))
+}
+predict_three_21 <- function(features, X) {
+  predictions <- list(
+    "Logistic regression" = clip_probability(stats::predict(
+      logistic_fit, newdata = features, type = "response")),
+    "LASSO" = clip_probability(as.numeric(stats::predict(
+      lasso_cv, newx = X, s = "lambda.1se", type = "response"))),
+    "Random forest" = clip_probability(stats::predict(
+      forest_fit, data = features, num.threads = 2L)$predictions[, "FMD"])
+  )
+  if (any(vapply(predictions, function(p) any(!is.finite(p)) || length(p) != nrow(features),
+                 logical(1)))) {
+    stop("One or more model prediction vectors are invalid.")
+  }
+  predictions
+}
+
+weighted_roc_21 <- function(y, p, w) {
+  stopifnot(length(y) == length(p), length(y) == length(w),
+            all(y %in% c(0L, 1L)), all(w > 0), all(is.finite(w)),
+            all(is.finite(p)))
+  d <- data.table::data.table(score = as.numeric(p),
+    positive_weight = ifelse(y == 1L, w, 0),
+    negative_weight = ifelse(y == 0L, w, 0))
+  d <- d[, .(positive_weight = sum(positive_weight),
+             negative_weight = sum(negative_weight)), by = score][order(-score)]
+  p_total <- sum(d$positive_weight)
+  n_total <- sum(d$negative_weight)
+  if (p_total <= 0 || n_total <= 0) stop("AUROC needs both outcome classes.")
+  coords <- data.table::data.table(
+    FPR = c(0, cumsum(d$negative_weight) / n_total),
+    TPR = c(0, cumsum(d$positive_weight) / p_total)
+  )
+  auc <- sum(diff(coords$FPR) *
+               (head(coords$TPR, -1L) + tail(coords$TPR, -1L)) / 2)
+  list(coords = coords, auc = auc)
+}
+weighted_metrics_21 <- function(y, p, w) {
+  list(auroc = weighted_roc_21(y, p, w)$auc,
+       brier = weighted_mean_21((p - y)^2, w),
+       observed_pct = 100 * weighted_mean_21(y, w),
+       predicted_pct = 100 * weighted_mean_21(p, w))
+}
+preds_2024_raw <- predict_three_21(valid_df, X_valid)
+preds_2025_raw <- predict_three_21(test_df, X_test)
+
+make_metrics_table <- function(y, w, probs, year, version) {
+  data.table::rbindlist(lapply(names(probs), function(name) {
+    s <- weighted_metrics_21(y, probs[[name]], w)
+    data.table::data.table(YEAR = year, version = version, model = name,
+      AUROC = s$auroc, Brier = s$brier,
+      observed_prevalence_pct = s$observed_pct,
+      mean_predicted_pct = s$predicted_pct,
+      calibration_error_pp = s$predicted_pct - s$observed_pct)
+  }))
+}
+validation_2024 <- make_metrics_table(
+  valid$FMD, valid$RAW_WEIGHT, preds_2024_raw, 2024L, "raw")
+data.table::setorder(validation_2024, Brier)
+selected_model <- validation_2024$model[[1L]]
+write_table_21(validation_2024, "21_2024_raw_model_selection")
+print(validation_2024)
+cat("[SELECTED ON 2024 BRIER]", selected_model, "\n")
+```
+
+## 6 — Recalibrate each model using 2024 (intercept only)
+
+An intercept-only probability shift adjusts the model's overall predicted prevalence to the 2024 observed prevalence; it does not alter within-model ranking or AUROC. The transformation is frozen before scoring 2025. Calibration **on 2024 itself will appear perfect in the large by construction**; the independent-year calibration check is 2025. We do **not** fit a separate 2025 adjustment.
+
+```{r calibrate-2024}
+fit_intercept_adjustment <- function(y, p, w) {
+  p <- clip_probability(p)
+  observed <- weighted_mean_21(y, w)
+  f <- function(alpha) {
+    weighted_mean_21(stats::plogis(stats::qlogis(p) + alpha), w) - observed
+  }
+  if (f(-30) * f(30) >= 0) stop("Could not bracket calibration intercept.")
+  stats::uniroot(f, c(-30, 30), tol = 1e-10)$root
+}
+apply_adjustment <- function(p, alpha) {
+  clip_probability(stats::plogis(stats::qlogis(clip_probability(p)) + alpha))
+}
+intercepts <- vapply(names(preds_2024_raw), function(name) {
+  fit_intercept_adjustment(valid$FMD, preds_2024_raw[[name]], valid$RAW_WEIGHT)
+}, numeric(1))
+preds_2024_cal <- lapply(names(preds_2024_raw), function(name) {
+  apply_adjustment(preds_2024_raw[[name]], intercepts[[name]])
+})
+names(preds_2024_cal) <- names(preds_2024_raw)
+preds_2025_cal <- lapply(names(preds_2025_raw), function(name) {
+  apply_adjustment(preds_2025_raw[[name]], intercepts[[name]])
+})
+names(preds_2025_cal) <- names(preds_2025_raw)
+
+calibration_table <- data.table::data.table(
+  model = names(intercepts), calibration_year = 2024L,
+  intercept_adjustment = as.numeric(intercepts)
+)
+write_table_21(calibration_table, "21_2024_calibration_intercepts")
+saveRDS(list(intercepts = intercepts, selection_2024 = selected_model,
+             source_md5 = source_checksum),
+        file.path(model_dir, "21_2024_selection_calibration.rds"))
+print(calibration_table)
+```
+
+## 7 — 2025 final-year evaluation: three models on the same records
+
+Includes the 2023 **prevalence-only** reference model (a constant probability estimated exclusively from 2023) so the Brier scores have a practical reference. This reference has no ranking information and an AUROC of 0.5. Report the 2025 results as **exploratory** given previous inspection of this year's outcome.
+
+```{r evaluate-2025}
+results <- data.table::rbindlist(list(
+  make_metrics_table(test$FMD, test$RAW_WEIGHT, preds_2025_raw, 2025L, "raw"),
+  make_metrics_table(test$FMD, test$RAW_WEIGHT, preds_2025_cal, 2025L, "calibrated")
+))
+base_rate_2023 <- weighted_mean_21(train$FMD, train$RAW_WEIGHT)
+baseline_metrics <- weighted_metrics_21(
+  test$FMD, rep(base_rate_2023, nrow(test)), test$RAW_WEIGHT)
+reference <- data.table::data.table(
+  YEAR = 2025L, version = "historical_reference", model = "Prevalence-only",
+  AUROC = 0.5, Brier = baseline_metrics$brier,
+  observed_prevalence_pct = baseline_metrics$observed_pct,
+  mean_predicted_pct = baseline_metrics$predicted_pct,
+  calibration_error_pp = baseline_metrics$predicted_pct - baseline_metrics$observed_pct
+)
+results <- data.table::rbindlist(list(results, reference), fill = TRUE)
+write_table_21(results, "21_2025_model_metrics_raw_calibrated")
+print(results[order(version, Brier)])
+
+# This table is the main apples-to-apples 2025 comparison of recalibrated models.
+main_2025 <- results[version == "calibrated"]
+write_table_21(main_2025, "21_2025_calibrated_three_model_comparison")
+
+plot_brier <- ggplot2::ggplot(
+  data.table::rbindlist(list(main_2025[, .(model, Brier)],
+                             reference[, .(model, Brier)])),
+  ggplot2::aes(x = reorder(model, Brier), y = Brier, fill = model)
+) + ggplot2::geom_col(width = .65) + ggplot2::coord_flip() +
+  ggplot2::scale_fill_manual(values = c(colors_21, "Prevalence-only" = "#B6B2A9")) +
+  plot_theme_21() + ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(title = "Expanded AI/AN models: 2025 Brier scores",
+    subtitle = "Lower is better | Models recalibrated using 2024 only",
+    x = NULL, y = "Survey-weighted Brier score")
+write_plot_21(plot_brier, "21_2025_brier_comparison", 10, 5.5)
+
+plot_calibration <- ggplot2::ggplot(main_2025,
+  ggplot2::aes(x = model, y = mean_predicted_pct, color = model)) +
+  ggplot2::geom_point(size = 3.5) +
+  ggplot2::geom_hline(yintercept = weighted_mean_21(test$FMD, test$RAW_WEIGHT) * 100,
+                      linetype = "dashed", color = "#584435") +
+  ggplot2::scale_color_manual(values = colors_21) +
+  plot_theme_21() + ggplot2::theme(legend.position = "none") +
+  ggplot2::labs(title = "2025 AI/AN observed and mean predicted FMD",
+    subtitle = "Dashed line is the observed 2025 weighted prevalence",
+    x = NULL, y = "Mean predicted FMD (%)")
+write_plot_21(plot_calibration, "21_2025_mean_predictions", 10, 5.5)
+```
+
+## 8 — ROC curves and AUROC comparison
+
+The same **2025 AI/AN evaluation respondents** are used for all three curves. The intercept-only recalibration changes probabilities, but preserves rankings and thus each model's ROC/AUROC. The curves reflect weighted point estimates, without survey-design confidence intervals.
+
+```{r plot-roc}
+roc_plot_data <- data.table::rbindlist(lapply(names(preds_2025_cal), function(name) {
+  r <- weighted_roc_21(test$FMD, preds_2025_cal[[name]], test$RAW_WEIGHT)
+  d <- data.table::copy(r$coords)
+  d[, model := name]
+  d[, model_label := sprintf("%s (AUROC %.3f)", name, r$auc)]
+  d
+}))
+write_table_21(roc_plot_data, "21_2025_roc_coordinates")
+label_lookup <- stats::setNames(
+  sprintf("%s (AUROC %.3f)", main_2025$model, main_2025$AUROC), main_2025$model)
+roc_plot_data[, model_label := factor(model_label, levels = unname(label_lookup))]
+roc_palette <- stats::setNames(unname(colors_21[names(label_lookup)]), unname(label_lookup))
+plot_roc <- ggplot2::ggplot(roc_plot_data,
+  ggplot2::aes(FPR, TPR, color = model_label)) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, color = "gray65", linetype = "dashed") +
+  ggplot2::geom_step(linewidth = 1.1) +
+  ggplot2::scale_color_manual(values = roc_palette) +
+  ggplot2::coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  plot_theme_21() +
+  ggplot2::labs(title = "2025 AI/AN ROC: three expanded-feature models",
+    subtitle = "Survey-weighted | Same 2025 respondents across models",
+    x = "False positive rate (1 - specificity)",
+    y = "True positive rate (sensitivity)", color = "Classifier")
+write_plot_21(plot_roc, "21_2025_three_model_roc", 9, 7)
+```
+
+## 9 — Confusion matrices at 0.16, 0.20, and 0.50
+
+A confusion matrix requires a fixed classification threshold. A lower cutoff generally flags more respondents and changes the tradeoff between sensitivity and specificity. We report **survey-weighted percentages and performance rates**, as well as **unweighted respondent counts**. These exploratory cutoffs have **not** been selected or validated for clinical triage or service eligibility.
+
+```{r confusion-matrices}
+thresholds <- c(0.16, 0.20, 0.50)
+confusion_rows <- list()
+row_id <- 0L
+for (model_name in names(preds_2025_cal)) {
+  probability <- preds_2025_cal[[model_name]]
+  for (cutoff in thresholds) {
+    prediction <- as.integer(probability >= cutoff)
+    for (actual in c(1L, 0L)) {
+      for (predicted in c(0L, 1L)) {
+        row_id <- row_id + 1L
+        mask <- test$FMD == actual & prediction == predicted
+        confusion_rows[[row_id]] <- data.table::data.table(
+          model = model_name, threshold = cutoff,
+          actual = actual, predicted = predicted,
+          unweighted_n = sum(mask), weighted_n = sum(test$RAW_WEIGHT[mask])
+        )
+      }
+    }
+  }
+}
+cm <- data.table::rbindlist(confusion_rows)
+cm[, row_weighted_pct := 100 * weighted_n / sum(weighted_n),
+   by = .(model, threshold, actual)]
+cm[, actual_label := factor(ifelse(actual == 1L, "Actual FMD", "Actual no FMD"),
+                            levels = c("Actual no FMD", "Actual FMD"))]
+cm[, predicted_label := factor(ifelse(predicted == 1L, "Predicted FMD", "Predicted no FMD"),
+                               levels = c("Predicted no FMD", "Predicted FMD"))]
+cm[, classification := ifelse(actual == predicted,
+  ifelse(actual == 1L, "True positive", "True negative"),
+  ifelse(actual == 1L, "False negative", "False positive"))]
+write_table_21(cm, "21_2025_confusion_matrices")
+print(cm)
+
+metric_from_cm <- function(x) {
+  TP <- x[actual == 1L & predicted == 1L, weighted_n]
+  FN <- x[actual == 1L & predicted == 0L, weighted_n]
+  TN <- x[actual == 0L & predicted == 0L, weighted_n]
+  FP <- x[actual == 0L & predicted == 1L, weighted_n]
+  safe_div <- function(a, b) if (b > 0) a / b else NA_real_
+  sens <- safe_div(TP, TP + FN)
+  spec <- safe_div(TN, TN + FP)
+  prec <- safe_div(TP, TP + FP)
+  data.table::data.table(
+    sensitivity_pct = 100 * sens,
+    specificity_pct = 100 * spec,
+    precision_pct = 100 * prec,
+    flagged_pct = 100 * safe_div(TP + FP, TP + FN + TN + FP),
+    accuracy_pct = 100 * safe_div(TP + TN, TP + FN + TN + FP),
+    balanced_accuracy_pct = 50 * (sens + spec),
+    F1_pct = 100 * safe_div(2 * prec * sens, prec + sens)
+  )
+}
+classification_metrics <- cm[, metric_from_cm(.SD), by = .(model, threshold)]
+write_table_21(classification_metrics, "21_2025_classification_metrics")
+print(classification_metrics)
+
+cm_palette <- c("True positive" = "#69B4AE", "True negative" = "#CDE1DD",
+                "False positive" = "#F0D29F", "False negative" = "#E4B09E")
+for (cutoff in thresholds) {
+  pd <- cm[threshold == cutoff]
+  heatmap <- ggplot2::ggplot(pd, ggplot2::aes(x = predicted_label,
+                                              y = actual_label, fill = classification)) +
+    ggplot2::geom_tile(color = "white", linewidth = 2) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf(
+      "%.1f%%\nn = %s", row_weighted_pct,
+      format(unweighted_n, big.mark = ",", scientific = FALSE))),
+      color = "#42352D", size = 4.2, lineheight = 1.45) +
+    ggplot2::facet_wrap(~model, nrow = 1) +
+    ggplot2::scale_fill_manual(values = cm_palette) +
+    ggplot2::coord_equal() + plot_theme_21() +
+    ggplot2::theme(panel.grid = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 0, hjust = .5)) +
+    ggplot2::labs(
+      title = sprintf("2025 AI/AN confusion matrices | cutoff %.2f", cutoff),
+      subtitle = "Survey-weighted percentages within actual FMD class; unweighted counts",
+      x = "Model classification", y = "Reported outcome", fill = "Classification")
+  write_plot_21(heatmap,
+    paste0("21_2025_confusion_cutoff_", sprintf("%02d", round(cutoff * 100))),
+    width = 13, height = 5.6)
+}
+```
+
+## 10 — Optional model interpretation and reproducibility
+
+Random-forest importance is a descriptive measure of **model reliance**, not a causal ranking of determinants. Correlated predictors may divide their apparent importance. Logistic/LASSO coefficients are also conditional on the other predictors and the chosen encoding. We save these outputs to help with interpretation, while emphasizing that variable effects should not be interpreted as evidence of causation.
+
+```{r interpretation-and-manifest}
+forest_importance <- data.table::data.table(
+  feature = names(forest_fit$variable.importance),
+  permutation_importance = as.numeric(forest_fit$variable.importance)
+)[order(-permutation_importance)]
+write_table_21(forest_importance, "21_2023_forest_predictor_importance")
+print(head(forest_importance, 12L))
+
+lasso_coef <- as.matrix(stats::coef(lasso_cv, s = "lambda.1se"))
+lasso_coef_table <- data.table::data.table(
+  encoded_predictor = rownames(lasso_coef), coefficient = as.numeric(lasso_coef[, 1L])
+)[order(-abs(coefficient))]
+write_table_21(lasso_coef_table, "21_2023_lasso_coefficients")
+
+manifest <- data.table::data.table(
+  item = c("source_file", "source_md5", "training_year", "validation_year",
+           "test_year", "selected_by_2024_brier", "selected_predictor_groups",
+           "train_respondents", "2024_respondents", "2025_respondents",
+           "2025_outcome_previously_inspected", "fit_survey_design_variance"),
+  value = c(source_path, source_checksum, "2023", "2024", "2025",
+            selected_model, as.character(length(selected_names)),
+            as.character(nrow(train)), as.character(nrow(valid)),
+            as.character(nrow(test)), "yes: exploratory 2025 comparison",
+            "not estimated; survey weights used as pseudo-weights")
+)
+write_table_21(manifest, "21_run_manifest")
+capture.output(sessionInfo(), file = file.path(output_root, "21_R_session_info.txt"))
+cat("[COMPLETE] Three expanded AI/AN classifiers evaluated for 2025.\n")
+cat("[OUTPUT]", output_root, "\n")
+```
+
+## 11 — Sensitivity: refit without GENHLTH and PHYSHLTH
+
+General health and physically unhealthy days are measured during the same period as the outcome, so they may carry much of the signal. This section repeats Sections 4 to 7 **after removing those two predictors**, keeping everything else fixed: the same 2023 preprocessing, outcome records, survey pseudo-weights, LASSO cross-validation folds, random-forest settings, and 2024 intercept recalibration. The 2025 results remain exploratory. Differences from the full models reflect the dropped predictors, but the models are refit, so random-number streams are not identical.
+
+```{r refit-without-health-status}
+drop_sources <- c("GENHLTH", "PHYSHLTH")
+source_by_feature <- vapply(feature_specs, `[[`, "", "source")
+drop_names <- intersect(feat_names[match(drop_sources, source_by_feature)], selected_names)
+if (length(drop_names) != length(drop_sources)) {
+  stop("Could not find both GENHLTH and PHYSHLTH among the selected predictors.")
+}
+reduced_names <- setdiff(selected_names, drop_names)
+cat("[NO HEALTH STATUS] Dropped:", paste(drop_names, collapse = ", "),
+    "| Remaining predictor groups:", length(reduced_names), "\n")
+
+# Reuse the Section 3 preprocessing; only the columns change.
+train_nh <- as.data.frame(train[, ..reduced_names])
+valid_nh <- as.data.frame(valid[, ..reduced_names])
+test_nh <- as.data.frame(test[, ..reduced_names])
+X_train_nh <- model_matrix(train_nh)
+X_valid_nh <- model_matrix(valid_nh)
+X_test_nh <- model_matrix(test_nh)
+stopifnot(identical(colnames(X_train_nh), colnames(X_valid_nh)),
+          identical(colnames(X_train_nh), colnames(X_test_nh)))
+
+# 1: Logistic regression.
+logistic_nh <- stats::glm(
+  FMD ~ ., data = data.frame(FMD = as.integer(train$FMD), train_nh, check.names = FALSE),
+  weights = train_weights, family = stats::binomial(),
+  control = stats::glm.control(maxit = 100, epsilon = 1e-8)
+)
+if (!isTRUE(logistic_nh$converged)) {
+  warning("Logistic regression (no health status) did not fully converge.")
+}
+
+# 2: LASSO, using the same within-2023 folds as Section 4.
+lasso_nh <- glmnet::cv.glmnet(
+  x = X_train_nh, y = train$FMD, weights = train_weights,
+  family = "binomial", alpha = 1, foldid = fold_id,
+  type.measure = "mse", standardize = TRUE, nlambda = 80
+)
+
+# 3: Random forest with the Section 4 settings.
+set.seed(44L)
+forest_nh <- ranger::ranger(
+  formula = FMD_class ~ .,
+  data = data.frame(
+    FMD_class = factor(ifelse(train$FMD == 1L, "FMD", "No_FMD"),
+                       levels = c("No_FMD", "FMD")),
+    train_nh, check.names = FALSE),
+  probability = TRUE, num.trees = 400L,
+  mtry = max(2L, floor(sqrt(length(reduced_names)))),
+  min.node.size = 50L, splitrule = "gini", case.weights = train_weights,
+  seed = 44L, num.threads = 2L
+)
+
+predict_three_nh <- function(features, X) {
+  list(
+    "Logistic regression" = clip_probability(stats::predict(
+      logistic_nh, newdata = features, type = "response")),
+    "LASSO" = clip_probability(as.numeric(stats::predict(
+      lasso_nh, newx = X, s = "lambda.1se", type = "response"))),
+    "Random forest" = clip_probability(stats::predict(
+      forest_nh, data = features, num.threads = 2L)$predictions[, "FMD"])
+  )
+}
+preds_2024_nh <- predict_three_nh(valid_nh, X_valid_nh)
+preds_2025_nh <- predict_three_nh(test_nh, X_test_nh)
+
+# Intercept adjustments use 2024 only, as in Section 6.
+intercepts_nh <- vapply(names(preds_2024_nh), function(name) {
+  fit_intercept_adjustment(valid$FMD, preds_2024_nh[[name]], valid$RAW_WEIGHT)
+}, numeric(1))
+preds_2025_nh_cal <- stats::setNames(lapply(names(preds_2025_nh), function(name) {
+  apply_adjustment(preds_2025_nh[[name]], intercepts_nh[[name]])
+}), names(preds_2025_nh))
+
+metrics_nh <- data.table::rbindlist(list(
+  make_metrics_table(valid$FMD, valid$RAW_WEIGHT, preds_2024_nh, 2024L, "raw"),
+  make_metrics_table(test$FMD, test$RAW_WEIGHT, preds_2025_nh, 2025L, "raw"),
+  make_metrics_table(test$FMD, test$RAW_WEIGHT, preds_2025_nh_cal, 2025L, "calibrated")
+))
+write_table_21(metrics_nh, "21_no_health_status_metrics")
+print(metrics_nh[order(YEAR, version, Brier)])
+
+# Side-by-side with the full-predictor models (2025, recalibrated).
+comparison_nh <- data.table::rbindlist(list(
+  main_2025[model %in% names(colors_21)][, feature_set := "All selected predictors"],
+  metrics_nh[YEAR == 2025L & version == "calibrated"][,
+    feature_set := "Without GENHLTH and PHYSHLTH"]
+), use.names = TRUE, fill = TRUE)
+write_table_21(comparison_nh, "21_no_health_status_vs_full_2025")
+print(comparison_nh[, .(feature_set, model, AUROC, Brier, calibration_error_pp)][
+  order(model, feature_set)])
+
+plot_data_nh <- data.table::melt(
+  comparison_nh, id.vars = c("model", "feature_set"),
+  measure.vars = c("AUROC", "Brier"), variable.name = "metric")
+plot_nh <- ggplot2::ggplot(plot_data_nh,
+  ggplot2::aes(x = model, y = value, fill = feature_set)) +
+  ggplot2::geom_col(position = "dodge", width = .7) +
+  ggplot2::facet_wrap(~metric, scales = "free_y") +
+  plot_theme_21() +
+  ggplot2::labs(
+    title = "2025 AI/AN models with and without general and physical health status",
+    subtitle = "Survey-weighted point estimates | Recalibrated on 2024 only | Exploratory",
+    x = NULL, y = NULL, fill = "Predictors")
+write_plot_21(plot_nh, "21_no_health_status_comparison", 11, 5.5)
+
+saveRDS(list(logistic = logistic_nh, lasso = lasso_nh, forest = forest_nh,
+             dropped = drop_names, predictors = reduced_names,
+             intercepts = intercepts_nh),
+        file.path(model_dir, "21_no_health_status_models.rds"))
+```
+
+### ROC curves without general and physical health status
+
+The same 2025 respondents are scored by each model. Solid lines are the models without `GENHLTH` and `PHYSHLTH`; dashed lines repeat the full-predictor models from Section 8 for reference. Intercept recalibration does not change rankings, so the curves are unaffected by it.
+
+```{r roc-without-health-status}
+roc_nh <- data.table::rbindlist(lapply(names(preds_2025_nh_cal), function(name) {
+  r <- weighted_roc_21(test$FMD, preds_2025_nh_cal[[name]], test$RAW_WEIGHT)
+  d <- data.table::copy(r$coords)
+  d[, `:=`(model = name, feature_set = "Without GENHLTH and PHYSHLTH", auroc = r$auc)]
+  d
+}))
+roc_full <- data.table::rbindlist(lapply(names(preds_2025_cal), function(name) {
+  r <- weighted_roc_21(test$FMD, preds_2025_cal[[name]], test$RAW_WEIGHT)
+  d <- data.table::copy(r$coords)
+  d[, `:=`(model = name, feature_set = "All selected predictors", auroc = r$auc)]
+  d
+}))
+roc_compare <- data.table::rbindlist(list(roc_nh, roc_full))
+roc_compare[, model := factor(model, levels = names(colors_21))]
+write_table_21(roc_compare[, .(model, feature_set, FPR, TPR)],
+               "21_no_health_status_roc_coordinates")
+
+auroc_labels <- unique(roc_compare[, .(model, feature_set, auroc)])[
+  , .(label = paste(sprintf("%s: AUROC %.3f",
+        ifelse(feature_set == "All selected predictors", "All predictors", "Without health status"),
+        auroc), collapse = "\n")), by = model]
+plot_roc_nh <- ggplot2::ggplot(roc_compare,
+  ggplot2::aes(FPR, TPR, color = model, linetype = feature_set)) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, color = "gray65", linetype = "dotted") +
+  ggplot2::geom_step(linewidth = 1.1) +
+  ggplot2::geom_text(data = auroc_labels, ggplot2::aes(label = label),
+    x = 0.98, y = 0.04, hjust = 1, vjust = 0, size = 3.4,
+    color = "#42352D", inherit.aes = FALSE) +
+  ggplot2::facet_wrap(~model, nrow = 1) +
+  ggplot2::scale_color_manual(values = colors_21, guide = "none") +
+  ggplot2::scale_linetype_manual(values = c("All selected predictors" = "dashed",
+    "Without GENHLTH and PHYSHLTH" = "solid")) +
+  ggplot2::coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  plot_theme_21() +
+  ggplot2::labs(
+    title = "2025 AI/AN ROC: effect of removing general and physical health status",
+    subtitle = "Survey-weighted point estimates | Same 2025 respondents | Exploratory",
+    x = "False positive rate (1 - specificity)",
+    y = "True positive rate (sensitivity)", linetype = "Predictors")
+write_plot_21(plot_roc_nh, "21_no_health_status_roc", 13, 5.6)
+```
+
+### Confusion matrices without general and physical health status
+
+Same layout and cutoffs as Section 9 (0.16, 0.20, and 0.50), using the recalibrated models without `GENHLTH` and `PHYSHLTH`. Percentages are survey-weighted within each actual FMD class; counts are unweighted respondents.
+
+```{r confusion-without-health-status}
+cm_nh <- data.table::rbindlist(lapply(names(preds_2025_nh_cal), function(model_name) {
+  data.table::rbindlist(lapply(thresholds, function(cutoff) {
+    prediction <- as.integer(preds_2025_nh_cal[[model_name]] >= cutoff)
+    data.table::rbindlist(lapply(c(1L, 0L), function(actual) {
+      data.table::rbindlist(lapply(c(0L, 1L), function(predicted) {
+        mask <- test$FMD == actual & prediction == predicted
+        data.table::data.table(model = model_name, threshold = cutoff,
+          actual = actual, predicted = predicted,
+          unweighted_n = sum(mask), weighted_n = sum(test$RAW_WEIGHT[mask]))
+      }))
+    }))
+  }))
+}))
+cm_nh[, row_weighted_pct := 100 * weighted_n / sum(weighted_n),
+      by = .(model, threshold, actual)]
+cm_nh[, actual_label := factor(ifelse(actual == 1L, "Actual FMD", "Actual no FMD"),
+                               levels = c("Actual no FMD", "Actual FMD"))]
+cm_nh[, predicted_label := factor(ifelse(predicted == 1L, "Predicted FMD", "Predicted no FMD"),
+                                  levels = c("Predicted no FMD", "Predicted FMD"))]
+cm_nh[, classification := ifelse(actual == predicted,
+  ifelse(actual == 1L, "True positive", "True negative"),
+  ifelse(actual == 1L, "False negative", "False positive"))]
+write_table_21(cm_nh, "21_no_health_status_confusion_matrices")
+
+classification_nh <- cm_nh[, metric_from_cm(.SD), by = .(model, threshold)]
+write_table_21(classification_nh, "21_no_health_status_classification_metrics")
+print(classification_nh)
+
+for (cutoff in thresholds) {
+  heatmap_nh <- ggplot2::ggplot(cm_nh[threshold == cutoff],
+    ggplot2::aes(x = predicted_label, y = actual_label, fill = classification)) +
+    ggplot2::geom_tile(color = "white", linewidth = 2) +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.1f%%\nn = %s", row_weighted_pct,
+      format(unweighted_n, big.mark = ",", scientific = FALSE))),
+      color = "#42352D", size = 4.2, lineheight = 1.45) +
+    ggplot2::facet_wrap(~model, nrow = 1) +
+    ggplot2::scale_fill_manual(values = cm_palette) +
+    ggplot2::coord_equal() + plot_theme_21() +
+    ggplot2::theme(panel.grid = ggplot2::element_blank(),
+      axis.text.x = ggplot2::element_text(angle = 0, hjust = .5)) +
+    ggplot2::labs(
+      title = sprintf("2025 AI/AN confusion matrices without health status | cutoff %.2f", cutoff),
+      subtitle = "Survey-weighted percentages within actual FMD class; unweighted counts",
+      x = "Model classification", y = "Reported outcome", fill = "Classification")
+  write_plot_21(heatmap_nh,
+    paste0("21_no_health_status_confusion_cutoff_", sprintf("%02d", round(cutoff * 100))),
+    width = 13, height = 5.6)
+}
+```
+
+## Interpretation checklist
+
+1. Compare 2025 survey-weighted **AUROC, Brier score, and calibration-in-the-large** together. The model with highest AUROC need not have the lowest Brier score.
+2. At a fixed cutoff, examine **sensitivity, specificity, precision, and fraction flagged**; none of the three cutoffs is an approved care threshold.
+3. Check the `21_2023_feature_selection.csv` and `21_imputation_and_unseen_codes.csv` before making substantive claims about any raw BRFSS code. These predictors should be reviewed against year-specific CDC codebooks.
+4. The 2025 sample is the *same survey year* already examined in other project work; comparisons with prior models are hypothesis-generating and need an independent future survey or truly untouched test set.
+5. FMD and physical-health days refer to the same recall period. Applications to **future** service needs require prospective validation with an operationally appropriate outcome, community involvement, and Indigenous data governance.

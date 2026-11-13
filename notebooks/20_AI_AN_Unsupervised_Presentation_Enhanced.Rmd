@@ -1,0 +1,902 @@
+---
+title: "20 — AI/AN unsupervised analysis with presentation-ready figures"
+subtitle: "Original analysis preserved; additional slide-ready visualizations"
+output: html_notebook
+---
+
+## Purpose
+
+**Research question:** What patterns emerge among physical-health, healthcare-access, functional-health, socioeconomic, and demographic characteristics reported by AI/AN-alone BRFSS respondents? Are comparable profiles present in 2024 and 2025, and how does *frequent mental distress* (FMD) vary across those profiles?
+
+**Updated source:** `aian_all_variables_2023_2025.rds` in `data/processed/` or `processed/`. This is the **raw-variable** AI/AN dataset, replacing `aian_subset_2023_2025.rds` used in the earlier version of Notebook 20. It contains a much wider set of original BRFSS questionnaire variables. The notebook prints the actual row/column counts, checks coverage by year, and documents which variables are retained.
+
+**Plan:** (1) audit original variable codes and missingness, (2) identify usable *prespecified* predictors across all three years, (3) fit PCA and k-means on 2023 data, (4) assign the later respondents to unchanged 2023-derived clusters, and (5) examine survey-weighted profile characteristics and FMD prevalence *after* clustering.
+
+**Non-stigmatizing variable choices:** The candidate list covers physical health, chronic conditions, access to healthcare, functional limitations, exercise, housing, income, education, employment, age, and sex. It deliberately excludes substance and alcohol use, race codes, mental-health outcome measures (`MENTHLTH`, `_MENT14D`), and depression diagnoses (`ADDEPEV3`). These are deliberate study-scope choices; excluded variables can still be valid in other research.
+
+**Important:** The raw BRFSS file contains values such as 7, 9, 77, 88, and 99 that can mean different things for different questions. This notebook uses **variable-specific allowed codes** and treats other responses as missing. Review coding against the CDC 2023, 2024, and 2025 codebooks before interpreting any selected variable. Later years are **different survey respondents**, not longitudinal follow-up of individuals. Cluster descriptions are exploratory and not clinical categories, causal findings, or prospective mental-health predictions. Survey weights are used for descriptive summaries, not for fitting PCA/k-means or variance estimation.
+
+## 1 — Setup and load the new file
+
+```{r setup}
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) return(current)
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio before running this notebook.")
+        }
+        current <- parent
+    }
+}
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+for (pkg in c("data.table", "ggplot2", "scales")) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        stop("Please install the R package: ", pkg)
+    }
+}
+set.seed(42L)
+
+# Use a NEW output directory. Your previous Notebook 20 and run 0017 stay unchanged.
+output_root <- file.path(project_root, "outputs", "20_aian_unsupervised_presentation_enhanced_2023_2025")
+table_dir <- file.path(output_root, "tables")
+figure_dir <- file.path(output_root, "figures")
+model_dir <- file.path(output_root, "models")
+for (p in c(table_dir, figure_dir, model_dir)) {
+    dir.create(p, recursive = TRUE, showWarnings = FALSE)
+}
+save_table_20 <- function(d, name) {
+    path <- file.path(table_dir, paste0(name, ".csv"))
+    data.table::fwrite(d, path)
+    cat("[TABLE]", path, "\n")
+}
+save_plot_20 <- function(p, name, width = 10, height = 6) {
+    print(p)
+    path <- file.path(figure_dir, paste0(name, ".png"))
+    ggplot2::ggsave(path, plot = p, width = width, height = height,
+                    dpi = 300, bg = "white", limitsize = TRUE)
+    cat("[FIGURE]", path, "\n")
+}
+palette_20 <- c(teal = "#319F98", rust = "#AF6D46", gold = "#C69A51",
+                dark = "#584435", mauve = "#86718C", olive = "#7C8766",
+                blue = "#5B7891")
+plot_theme_20 <- function() {
+    ggplot2::theme_minimal(base_size = 12) +
+        ggplot2::theme(
+            plot.title = ggplot2::element_text(face = "bold", color = palette_20[["dark"]]),
+            plot.subtitle = ggplot2::element_text(color = palette_20[["rust"]]),
+            panel.grid.minor = ggplot2::element_blank(),
+            legend.position = "bottom"
+        )
+}
+weighted_mean_20 <- function(x, w) {
+    ok <- !is.na(x) & is.finite(x) & is.finite(w) & w > 0
+    if (!any(ok)) return(NA_real_)
+    sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+candidates <- c(
+    file.path(project_root, "data", "processed", "aian_all_variables_2023_2025.rds"),
+    file.path(project_root, "processed", "aian_all_variables_2023_2025.rds")
+)
+existing <- candidates[file.exists(candidates)]
+if (!length(existing)) {
+    stop("Cannot find aian_all_variables_2023_2025.rds in data/processed/ or processed/.")
+}
+source_file <- existing[[1]]
+source_md5 <- unname(tools::md5sum(source_file))
+raw <- data.table::as.data.table(readRDS(source_file))
+cat("[SOURCE]", source_file, "\n")
+cat("[AUDIT]", nrow(raw), "rows |", ncol(raw), "columns | MD5", source_md5, "\n")
+
+required <- c("YEAR", "_LLCPWT", "MENTHLTH", "PHYSHLTH", "GENHLTH")
+missing_required <- setdiff(required, names(raw))
+if (length(missing_required)) {
+    stop("Required raw fields are absent: ", paste(missing_required, collapse = ", "))
+}
+raw[, YEAR := as.integer(YEAR)]
+if (!identical(sort(unique(raw$YEAR)), 2023:2025)) {
+    stop("Expected only 2023–2025; found: ",
+         paste(sort(unique(raw$YEAR)), collapse = ", "))
+}
+raw[, RAW_WEIGHT := suppressWarnings(as.numeric(get("_LLCPWT")))]
+weight_audit <- raw[, .(
+    records = .N,
+    valid_weight_n = sum(is.finite(RAW_WEIGHT) & RAW_WEIGHT > 0),
+    invalid_weight_n = sum(!is.finite(RAW_WEIGHT) | RAW_WEIGHT <= 0)
+), by = YEAR][order(YEAR)]
+save_table_20(weight_audit, "20_source_year_and_weight_audit")
+print(weight_audit)
+raw <- raw[is.finite(RAW_WEIGHT) & RAW_WEIGHT > 0]
+
+# This file is described as an AI/AN-only subset. Show source race-code
+# distributions for manual verification; do not silently redefine the cohort.
+for (race_field in intersect(c("_RACE", "_MRACE1"), names(raw))) {
+    race_audit <- raw[, .N, by = .(YEAR, code = as.character(get(race_field)))][
+        order(YEAR, -N)
+    ]
+    save_table_20(race_audit, paste0("20_source_race_audit_", gsub("^_", "", race_field)))
+    cat("[REVIEW COHORT CODING]", race_field, "\n")
+    print(race_audit[, head(.SD, 6L), by = YEAR])
+}
+```
+
+## 2 — Outcome audit (held out of all unsupervised fitting)
+
+BRFSS `MENTHLTH` reports mentally unhealthy days in the **same past 30 days** as the physical-health question. Here 1–30 means days; **88 means zero days**; 77/99 and other unexpected codes are missing. FMD = 1 for at least 14 days and 0 for fewer than 14 days. This variable is derived for *post-clustering analysis only*.
+
+```{r fmd-outcome-audit}
+mental_raw <- suppressWarnings(as.numeric(raw[["MENTHLTH"]]))
+mental_days <- rep(NA_real_, length(mental_raw))
+mental_days[mental_raw == 88 & !is.na(mental_raw)] <- 0
+is_day <- !is.na(mental_raw) & mental_raw >= 1 & mental_raw <= 30
+mental_days[is_day] <- mental_raw[is_day]
+raw[, FMD_POSTHOC := as.integer(mental_days >= 14)]
+raw[is.na(mental_days), FMD_POSTHOC := NA_integer_]
+
+annual_fmd <- raw[, .(
+    respondents = .N,
+    valid_fmd_n = sum(!is.na(FMD_POSTHOC)),
+    observed_fmd_n = sum(FMD_POSTHOC == 1L, na.rm = TRUE),
+    weighted_fmd_pct = 100 * weighted_mean_20(FMD_POSTHOC, RAW_WEIGHT)
+), by = YEAR][order(YEAR)]
+save_table_20(annual_fmd, "20_source_fmd_audit")
+print(annual_fmd)
+```
+
+## 3 — Define the expanded, prespecified predictor dictionary
+
+We do **not** automatically use all hundreds of survey fields. The full raw file mixes annual questionnaire versions, calculated variables, module-specific questions, sampling identifiers, and items with different missing-value codes. The list below starts with interpretable questions that could plausibly inform population-health service planning. Only candidates with adequate observed values **in all three years** are retained. Optional items with inadequate coverage are reported and omitted; the six core domains are checked separately.
+
+For categorical variables, values listed under `allowed` are treated as categories; these are **codes, not numeric quantities**. `EMPLOY1 = 7`, for example, is a valid employment response, so the same missing-code rule is **not** applied to every field.
+
+```{r prespecified-feature-dictionary}
+make_feature <- function(source, label, domain, allowed, core = FALSE,
+                         kind = "categorical") {
+    list(source = source, feature = label, domain = domain,
+         allowed = allowed, core = core, kind = kind)
+}
+features <- list(
+    make_feature("GENHLTH", "General health", "Physical health", 1:5, TRUE),
+    make_feature("PHYSHLTH", "Physically unhealthy days", "Physical health", 0:30, TRUE, "days"),
+    make_feature("_AGEG5YR", "Age group", "Demographics", 1:13, TRUE),
+    make_feature("SEXVAR", "Sex", "Demographics", 1:2, TRUE),
+    make_feature("EDUCA", "Education", "Socioeconomic", 1:6, TRUE),
+    make_feature("INCOME3", "Household income", "Socioeconomic", 1:11, TRUE),
+    make_feature("EMPLOY1", "Employment", "Socioeconomic", 1:8),
+    make_feature("RENTHOM1", "Home tenure", "Socioeconomic", 1:3),
+    make_feature("FOODSTMP", "Food assistance", "Socioeconomic", 1:2),
+    make_feature("PERSDOC3", "Has personal healthcare provider", "Healthcare access", 1:3),
+    make_feature("MEDCOST1", "Could not afford medical care", "Healthcare access", 1:2),
+    make_feature("CHECKUP1", "Time since routine checkup", "Healthcare access", c(1:4, 8)),
+    make_feature("EXERANY2", "Exercise in past 30 days", "Health activity", 1:2),
+    make_feature("DIFFWALK", "Difficulty walking", "Functional health", 1:2),
+    make_feature("DIFFDRES", "Difficulty dressing", "Functional health", 1:2),
+    make_feature("DIFFALON", "Difficulty doing errands alone", "Functional health", 1:2),
+    make_feature("DEAF", "Deaf or serious hearing difficulty", "Functional health", 1:2),
+    make_feature("BLIND", "Blind or serious visual difficulty", "Functional health", 1:2),
+    make_feature("ASTHMA3", "Ever diagnosed with asthma", "Chronic conditions", 1:2),
+    make_feature("CVDINFR4", "Heart attack history", "Chronic conditions", 1:2),
+    make_feature("CVDCRHD4", "Coronary heart disease history", "Chronic conditions", 1:2),
+    make_feature("CVDSTRK3", "Stroke history", "Chronic conditions", 1:2),
+    make_feature("CHCCOPD3", "COPD history", "Chronic conditions", 1:2),
+    make_feature("CHCKDNY2", "Kidney disease history", "Chronic conditions", 1:2),
+    make_feature("HAVARTH4", "Arthritis history", "Chronic conditions", 1:2),
+    make_feature("DIABETE4", "Diabetes status", "Chronic conditions", 1:4)
+)
+feature_dictionary <- data.table::rbindlist(lapply(features, function(z) {
+    data.table::data.table(
+        source = z$source, feature = z$feature, domain = z$domain,
+        kind = z$kind, core = z$core,
+        allowed_codes = paste(z$allowed, collapse = ","),
+        exists_in_source = z$source %in% names(raw)
+    )
+}))
+save_table_20(feature_dictionary, "20_candidate_feature_dictionary")
+print(feature_dictionary)
+
+# Decode with item-specific rules. PHYSHLTH=88 is no unhealthy days.
+clean_feature <- function(d, spec) {
+    if (!(spec$source %in% names(d))) return(rep(NA_real_, nrow(d)))
+    v <- suppressWarnings(as.numeric(d[[spec$source]]))
+    if (identical(spec$kind, "days")) {
+        v[!is.na(v) & v == 88] <- 0
+    }
+    v[is.na(v) | !(v %in% spec$allowed)] <- NA_real_
+    v
+}
+
+# Keep the original raw dataset unchanged. Numeric-coded categories remain
+# categories; one-hot encoding happens later.
+analysis <- data.table::copy(raw[, .(YEAR, RAW_WEIGHT, FMD_POSTHOC)])
+feature_values <- lapply(features, function(f) clean_feature(raw, f))
+for (i in seq_along(features)) {
+    analysis[, (features[[i]]$feature) := feature_values[[i]]]
+}
+
+coverage <- data.table::rbindlist(lapply(seq_along(features), function(i) {
+    f <- features[[i]]
+    analysis[, .(
+        source = f$source,
+        feature = f$feature,
+        domain = f$domain,
+        core = f$core,
+        available_n = sum(!is.na(get(f$feature))),
+        coverage_pct = 100 * mean(!is.na(get(f$feature))),
+        distinct_valid_codes = data.table::uniqueN(get(f$feature), na.rm = TRUE)
+    ), by = YEAR]
+}))
+save_table_20(coverage, "20_feature_coverage_by_year")
+
+# Core features may have missing responses; they must still be reasonably
+# available in every year. Optional features require >=75% in each year.
+# Imputation below uses 2023 modes/median; its limitations are documented.
+selection <- coverage[, .(
+    source = source[1], domain = domain[1], core = core[1],
+    minimum_year_coverage_pct = min(coverage_pct),
+    training_unique_codes = distinct_valid_codes[YEAR == 2023L][1]
+), by = feature]
+selection[, retain := ifelse(core,
+                            minimum_year_coverage_pct >= 50,
+                            minimum_year_coverage_pct >= 75) &
+                  training_unique_codes >= 2]
+selection[, reason := ifelse(retain, "Retained",
+                     ifelse(training_unique_codes < 2, "No training-year variation",
+                     "Missing / low year-specific coverage"))]
+selection[, retained_feature_order := match(feature, vapply(features, `[[`, "", "feature"))]
+data.table::setorder(selection, retained_feature_order)
+save_table_20(selection, "20_feature_selection_audit")
+print(selection[, .(source, feature, domain, core, minimum_year_coverage_pct,
+                    training_unique_codes, retain, reason)])
+
+required_core <- vapply(features, function(x) if (x$core) x$feature else NA_character_, "")
+required_core <- stats::na.omit(required_core)
+if (!all(required_core %in% selection[retain == TRUE]$feature)) {
+    stop("One or more core predictors are missing/too sparse. Check the feature audit and CDC codes.")
+}
+selected_features <- selection[retain == TRUE]$feature
+selected_spec <- features[match(selected_features, vapply(features, `[[`, "", "feature"))]
+cat("[SELECTED]", length(selected_features), "feature groups from",
+    length(unique(vapply(selected_spec, `[[`, "", "domain"))), "domains\n")
+```
+
+## 4 — Missingness, 2023-based imputation, and domain-balanced encoding
+
+The selected inputs may still contain missing responses. For reproducibility, missing values are imputed using the **2023 median** (physically unhealthy days) or **2023 most common category** (all other variables). Later-year values not observed at all in 2023 are also assigned to the 2023 mode, and their frequency is audited. This makes it possible to assign *every* weighted respondent to a 2023-derived profile, but missingness can mask important heterogeneity.
+
+Each categorical predictor is one-hot encoded and normalized so changing one category contributes the same squared distance as changing any other category within that variable. Predictors are further rescaled by the number of variables in their **domain** so that adding eight chronic-condition questions does not automatically overwhelm education and income. These are *analysis choices* that need sensitivity checks before interpretation.
+
+```{r fit-imputation-and-encoding}
+train_mask <- analysis$YEAR == 2023L
+if (sum(train_mask) < 500) stop("Fewer than 500 eligible 2023 records.")
+
+modal_value <- function(x) {
+    x <- x[!is.na(x)]
+    if (!length(x)) stop("Cannot compute training mode from all-missing values.")
+    as.numeric(names(sort(table(x), decreasing = TRUE)[1]))
+}
+
+fit_params <- list()
+unseen_rows <- list()
+for (f in selected_spec) {
+    x <- analysis[[f$feature]]
+    train_values <- x[train_mask]
+    replacement <- if (identical(f$kind, "days")) {
+        stats::median(train_values, na.rm = TRUE)
+    } else modal_value(train_values)
+    levels_train <- sort(unique(train_values[!is.na(train_values)]))
+    missing_now <- is.na(x)
+    unseen_now <- !is.na(x) & !(x %in% levels_train)
+    x[missing_now | unseen_now] <- replacement
+    analysis[, (f$feature) := x]
+
+    fit_params[[f$feature]] <- list(
+        replacement = replacement,
+        levels_2023 = levels_train,
+        mean_2023 = mean(x[train_mask]),
+        sd_2023 = stats::sd(x[train_mask]),
+        kind = f$kind,
+        domain = f$domain
+    )
+    unseen_rows[[length(unseen_rows) + 1L]] <- data.table::data.table(
+        feature = f$feature,
+        YEAR = sort(unique(analysis$YEAR)),
+        originally_missing_n = vapply(sort(unique(analysis$YEAR)),
+            function(y) sum(missing_now[analysis$YEAR == y]), numeric(1)),
+        unseen_2023_code_n = vapply(sort(unique(analysis$YEAR)),
+            function(y) sum(unseen_now[analysis$YEAR == y]), numeric(1))
+    )
+}
+imputation_audit <- data.table::rbindlist(unseen_rows)
+save_table_20(imputation_audit, "20_missing_and_unseen_codes_imputation")
+print(imputation_audit)
+
+domain_sizes <- table(vapply(selected_spec, `[[`, "", "domain"))
+encode_profiles <- function(d) {
+    pieces <- lapply(selected_spec, function(f) {
+        x <- d[[f$feature]]
+        params <- fit_params[[f$feature]]
+        domain_weight <- 1 / as.numeric(domain_sizes[[f$domain]])
+        if (identical(f$kind, "days")) {
+            s <- params$sd_2023
+            if (!is.finite(s) || s <= 0) stop("Physical-day variance is zero in 2023.")
+            z <- (x - params$mean_2023) / s
+            z <- pmax(-3, pmin(3, z))  # bound one extreme numeric axis
+            m <- matrix(z * sqrt(domain_weight), ncol = 1)
+            colnames(m) <- "Physically_unhealthy_days_z"
+        } else {
+            lev <- params$levels_2023
+            m <- outer(x, lev, `==`) * sqrt(domain_weight / 2)
+            colnames(m) <- paste0(
+                make.names(f$feature), "__code_", as.character(lev)
+            )
+        }
+        m
+    })
+    X <- do.call(cbind, pieces)
+    storage.mode(X) <- "double"
+    if (any(!is.finite(X))) stop("Encoded matrix includes non-finite values.")
+    X
+}
+
+X <- encode_profiles(analysis)
+train_index <- which(train_mask)
+X_train <- X[train_index, , drop = FALSE]
+cat("[ENCODED]", nrow(X_train), "2023 rows x", ncol(X_train),
+    "columns; all-year rows:", nrow(X), "\n")
+encoding_summary <- data.table::data.table(
+    encoded_column = colnames(X),
+    mean_2023 = colMeans(X_train),
+    sd_2023 = apply(X_train, 2, stats::sd)
+)
+save_table_20(encoding_summary, "20_final_encoded_feature_summary")
+```
+
+## 5 — PCA: describe patterns of variation
+
+PCA is fitted **only on 2023 encoded predictors**. The same transformation is then applied to 2024 and 2025. Component directions are arbitrary; PCA does not provide causal or diagnostic explanations.
+
+```{r pca-exploration}
+pca <- stats::prcomp(X_train, center = TRUE, scale. = FALSE)
+pca_scores <- stats::predict(pca, newdata = X)
+variance <- (pca$sdev^2) / sum(pca$sdev^2)
+variance_table <- data.table::data.table(
+    component = seq_along(variance),
+    variance_pct = 100 * variance,
+    cumulative_pct = 100 * cumsum(variance)
+)
+save_table_20(variance_table, "20_pca_variance")
+print(utils::head(variance_table, 10L))
+
+p_scree <- ggplot2::ggplot(
+    variance_table[component <= 12L],
+    ggplot2::aes(x = component, y = variance_pct)
+) +
+    ggplot2::geom_col(fill = palette_20[["teal"]], width = 0.7) +
+    ggplot2::scale_x_continuous(breaks = 1:12) +
+    plot_theme_20() +
+    ggplot2::labs(
+        title = "How much predictor variation is summarized by the PCA components?",
+        subtitle = "Expanded health, access, and social variables | fitted using 2023",
+        x = "Principal component", y = "Explained encoded variation (%)"
+    )
+save_plot_20(p_scree, "20_pca_variance", 10, 5)
+
+loadings <- data.table::data.table(
+    encoded_feature = rownames(pca$rotation),
+    PC1 = pca$rotation[, 1],
+    PC2 = pca$rotation[, 2]
+)
+save_table_20(loadings, "20_pca_loadings")
+leading <- data.table::copy(utils::head(loadings[order(-abs(PC1))], 16L))
+leading[, encoded_feature := factor(encoded_feature, levels = rev(encoded_feature))]
+p_load <- ggplot2::ggplot(leading, ggplot2::aes(x = encoded_feature, y = PC1)) +
+    ggplot2::geom_col(fill = palette_20[["rust"]]) +
+    ggplot2::coord_flip() + plot_theme_20() +
+    ggplot2::labs(
+        title = "Which encoded responses contribute most to PC1?",
+        subtitle = "Largest absolute loadings; inspect original codes before interpreting",
+        x = NULL, y = "PC1 loading"
+    )
+save_plot_20(p_load, "20_pca_pc1_loadings", 11, 7)
+
+analysis[, `:=`(PC1 = pca_scores[, 1], PC2 = pca_scores[, 2])]
+set.seed(43L)
+plot_idx <- sample.int(nrow(analysis), min(3500L, nrow(analysis)))
+p_year <- ggplot2::ggplot(
+    analysis[plot_idx], ggplot2::aes(PC1, PC2, color = factor(YEAR))
+) +
+    ggplot2::geom_point(alpha = 0.3, size = 1) +
+    ggplot2::scale_color_manual(values = c(
+        "2023" = palette_20[["rust"]], "2024" = palette_20[["gold"]],
+        "2025" = palette_20[["teal"]]
+    )) + plot_theme_20() +
+    ggplot2::labs(title = "AI/AN respondent profiles in PCA space",
+                  subtitle = "Same 2023 PCA projection applied to each survey year",
+                  x = "PC1", y = "PC2", color = "Year")
+save_plot_20(p_year, "20_pca_by_year", 10, 6)
+```
+
+## 6 — K-means cluster exploration using 2023 respondents
+
+We assess **2–6 clusters** using a fixed subsample of 2023 respondents to approximate silhouette width. The clustering is exploratory: changing the chosen feature set, domain balancing, missing-value treatment, or number of clusters may produce different profiles. The fitted model uses no FMD information.
+
+```{r kmeans-cluster-selection}
+set.seed(44L)
+ks <- 2:6
+sample_sil <- sample.int(nrow(X_train), min(650L, nrow(X_train)))
+D_sil <- as.matrix(stats::dist(X_train[sample_sil, , drop = FALSE]))
+mean_silhouette <- function(labels, distance_matrix) {
+    groups <- sort(unique(labels))
+    s <- vapply(seq_along(labels), function(i) {
+        same <- which(labels == labels[i])
+        if (length(same) <= 1L) return(0)
+        a <- mean(distance_matrix[i, same[same != i]])
+        other <- groups[groups != labels[i]]
+        b <- min(vapply(other, function(g) {
+            mean(distance_matrix[i, labels == g])
+        }, numeric(1)))
+        if (!is.finite(b) || max(a, b) == 0) return(0)
+        (b - a) / max(a, b)
+    }, numeric(1))
+    mean(s)
+}
+fits <- vector("list", length(ks))
+score_rows <- vector("list", length(ks))
+for (i in seq_along(ks)) {
+    k <- ks[i]
+    set.seed(100L + k)
+    fits[[i]] <- stats::kmeans(
+        X_train, centers = k, nstart = 12L,
+        iter.max = 100L, algorithm = "Lloyd"
+    )
+    score_rows[[i]] <- data.table::data.table(
+        k = k,
+        approximate_mean_silhouette = mean_silhouette(
+            fits[[i]]$cluster[sample_sil], D_sil
+        ),
+        within_cluster_sumsq = fits[[i]]$tot.withinss
+    )
+}
+k_scores <- data.table::rbindlist(score_rows)
+chosen_k <- k_scores$k[which.max(k_scores$approximate_mean_silhouette)]
+chosen_fit <- fits[[which(ks == chosen_k)]]
+save_table_20(k_scores, "20_cluster_selection")
+print(k_scores)
+cat("[SELECTED]", chosen_k, "exploratory clusters\n")
+
+p_k <- ggplot2::ggplot(
+    k_scores, ggplot2::aes(k, approximate_mean_silhouette)
+) + ggplot2::geom_line(color = palette_20[["dark"]]) +
+    ggplot2::geom_point(color = palette_20[["teal"]], size = 3) +
+    ggplot2::scale_x_continuous(breaks = ks) +
+    plot_theme_20() +
+    ggplot2::labs(title = "Exploring the number of 2023 respondent profiles",
+                  subtitle = "Approximate silhouette from a fixed subsample",
+                  x = "Number of clusters", y = "Mean silhouette")
+save_plot_20(p_k, "20_cluster_selection", 9, 5)
+```
+
+## 7 — Freeze the profiles and assign 2024–2025 respondents
+
+Cluster centers come from 2023 only. Later respondents are assigned using the same coding and nearest-center rule. The labels are ordered by mean **2023 physically unhealthy days**, without using FMD.
+
+```{r apply-2023-cluster-centers}
+assign_nearest <- function(X_new, centers) {
+    distances <- vapply(seq_len(nrow(centers)), function(j) {
+        diff <- sweep(X_new, 2, centers[j, ], FUN = "-")
+        rowSums(diff * diff)
+    }, numeric(nrow(X_new)))
+    if (is.null(dim(distances))) distances <- matrix(distances, ncol = 1L)
+    max.col(-distances, ties.method = "first")
+}
+assignment <- assign_nearest(X, chosen_fit$centers)
+assignment[train_index] <- chosen_fit$cluster
+analysis[, initial_cluster := assignment]
+rank_clusters <- analysis[YEAR == 2023L, .(
+    mean_physical_days = weighted_mean_20(`Physically unhealthy days`, RAW_WEIGHT)
+), by = initial_cluster][order(mean_physical_days, initial_cluster)]
+labels <- paste0("Profile ", seq_len(chosen_k))
+lookup <- stats::setNames(labels, as.character(rank_clusters$initial_cluster))
+analysis[, cluster := factor(lookup[as.character(initial_cluster)], levels = labels)]
+
+saveRDS(list(
+    source_md5 = source_md5,
+    fit_year = 2023L,
+    selected_feature_dictionary = feature_dictionary[feature %in% selected_features],
+    fit_params = fit_params,
+    domain_sizes = domain_sizes,
+    encoding_columns = colnames(X),
+    centers_2023 = chosen_fit$centers,
+    cluster_labels = lookup,
+    pca = pca
+), file.path(model_dir, "20_frozen_expanded_2023_profiles.rds"))
+
+profile_shares <- analysis[, .(
+    respondents = .N,
+    total_weight = sum(RAW_WEIGHT)
+), by = .(YEAR, cluster)]
+profile_shares[, share_pct := 100 * total_weight / sum(total_weight), by = YEAR]
+data.table::setorder(profile_shares, YEAR, cluster)
+save_table_20(profile_shares, "20_profile_shares_by_year")
+print(profile_shares)
+
+profile_colors <- stats::setNames(
+    rep(c(palette_20[["teal"]], palette_20[["rust"]], palette_20[["gold"]],
+          palette_20[["mauve"]], palette_20[["olive"]], palette_20[["blue"]]),
+        length.out = chosen_k), labels
+)
+p_share <- ggplot2::ggplot(profile_shares, ggplot2::aes(
+    x = factor(YEAR), y = share_pct, fill = cluster
+)) + ggplot2::geom_col(width = .7) +
+    ggplot2::scale_fill_manual(values = profile_colors) +
+    plot_theme_20() +
+    ggplot2::labs(title = "Share of respondents in each 2023-derived profile",
+                  subtitle = "Survey-weighted; different respondents each year",
+                  x = "Survey year", y = "Weighted share (%)", fill = "Profile")
+save_plot_20(p_share, "20_profile_shares_2023_2025", 10, 6)
+
+p_clusters <- ggplot2::ggplot(
+    analysis[plot_idx], ggplot2::aes(PC1, PC2, color = cluster)
+) + ggplot2::geom_point(alpha = .38, size = 1) +
+    ggplot2::scale_color_manual(values = profile_colors) +
+    plot_theme_20() +
+    ggplot2::labs(title = "Expanded AI/AN health profiles in PCA space",
+                  subtitle = "Profile assignment learned from 2023 only",
+                  x = "PC1", y = "PC2", color = "Profile")
+save_plot_20(p_clusters, "20_profiles_in_pca_space", 10, 6)
+```
+
+## 8 — Describe each profile with the original predictors
+
+Profile labels are intentionally neutral. We can describe observed characteristics and their survey-weighted distribution without assigning diagnoses, names with negative connotations, or causal interpretations. The audit includes the original BRFSS codes, so consult the relevant CDC codebook when converting categories into presentation labels.
+
+```{r describe-clusters}
+# Percentages are based on all respondents with valid survey weights in each year.
+# Feature-specific values were mode-imputed before clustering. For weighted
+# descriptive tables, report original observed responses where possible.
+profile_summary <- analysis[, .(
+    respondents = .N,
+    total_weight = sum(RAW_WEIGHT),
+    weighted_physical_days = weighted_mean_20(`Physically unhealthy days`, RAW_WEIGHT),
+    pct_fair_or_poor_general_health = 100 * weighted_mean_20(
+        `General health` %in% c(4, 5), RAW_WEIGHT
+    )
+), by = .(YEAR, cluster)][order(YEAR, cluster)]
+profile_summary[, weighted_share_pct := 100 * total_weight / sum(total_weight), by = YEAR]
+save_table_20(profile_summary, "20_profile_core_characteristics")
+print(profile_summary)
+
+# Comprehensive coded response distribution for EVERY selected predictor.
+# This table can be used to write accurate profile descriptions without
+# guessing which category a raw code refers to.
+profile_features <- data.table::rbindlist(lapply(selected_features, function(nm) {
+    d <- analysis[, .(YEAR, cluster, code = as.character(get(nm)),
+                      weight = RAW_WEIGHT)]
+    result <- d[, .(respondents = .N, weighted_n = sum(weight)),
+                by = .(YEAR, cluster, code)]
+    result[, weighted_pct := 100 * weighted_n / sum(weighted_n),
+           by = .(YEAR, cluster)]
+    result[, feature := nm]
+    result
+}), fill = TRUE)
+save_table_20(profile_features, "20_all_selected_feature_distributions_by_profile")
+
+# The study's original questionnaire columns are retained in memory only;
+# per-respondent raw data are NOT written into the output folder.
+```
+
+## 9 — Examine FMD AFTER fitting the unsupervised profiles
+
+The model never sees FMD while learning PCA axes or cluster centers. Post-hoc FMD prevalence helps describe associations between the profiles and the reported outcome. It does not establish temporal ordering, an individual's risk, or service needs in any specific Tribal Nation.
+
+```{r posthoc-fmd-by-profile}
+valid <- analysis[!is.na(FMD_POSTHOC)]
+posthoc_fmd <- valid[, .(
+    respondents = .N,
+    fmd_respondents = sum(FMD_POSTHOC == 1L),
+    weighted_fmd_pct = 100 * weighted_mean_20(FMD_POSTHOC, RAW_WEIGHT)
+), by = .(YEAR, cluster)][order(YEAR, cluster)]
+save_table_20(posthoc_fmd, "20_posthoc_fmd_by_profile_and_year")
+print(posthoc_fmd)
+
+p_fmd <- ggplot2::ggplot(
+    posthoc_fmd, ggplot2::aes(x = cluster, y = weighted_fmd_pct, fill = cluster)
+) + ggplot2::geom_col(width = .67) +
+    ggplot2::facet_wrap(~YEAR, nrow = 1) +
+    ggplot2::scale_fill_manual(values = profile_colors) +
+    ggplot2::scale_y_continuous(limits = c(0, NA), labels = function(x) paste0(x, "%")) +
+    plot_theme_20() + ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(title = "Frequent mental distress by unsupervised health profile",
+                  subtitle = "FMD was not used to fit PCA or clusters; descriptive weighted rates",
+                  x = "2023-derived profile", y = "Survey-weighted FMD prevalence (%)")
+save_plot_20(p_fmd, "20_posthoc_fmd_by_cluster", 12, 5.5)
+```
+
+## 9b — Presentation figures: explain the PCA axes and the profile differences
+
+These are **presentation versions of the same fitted PCA and k-means results**, not new fitted models. They retain the 2023 PCA and profile definitions, and they leave FMD completely out of PCA/cluster fitting. Outputs have filenames beginning `20_slide_` and can be added directly to presentation slides. The original diagnostic charts remain available too.
+
+**Interpretation first:** In this fit, PC1 is overwhelmingly associated with physically unhealthy days, while PC2 is overwhelmingly associated with the two exercise-response indicators. Accordingly, the two broad ribbons in the scatterplot primarily reflect exercise categories. The k-means profiles are largely separated by physical-health burden. Avoid describing the two profiles as clinically validated types of people or implying that PC1/PC2 jointly summarize all 25 predictor groups equally.
+
+### Figure A — Which variables shape the visible PCA axes?
+
+PCA loadings are reported for **encoded columns**. A categorical response appears as several one-hot columns, so the squared loadings are **summed within each original predictor group** before plotting. The contributions for all groups sum to 100% for each PC. These are PCA-axis contributions, *not* model feature importance for FMD.
+
+```{r slide-pca-axis-explanation}
+# Map encoded response columns back to their originating predictor group.
+column_to_feature <- function(column_name) {
+    if (identical(column_name, "Physically_unhealthy_days_z")) {
+        return("Physically unhealthy days")
+    }
+    feature_prefixes <- vapply(selected_spec, function(s) {
+        paste0(make.names(s$feature), "__code_")
+    }, character(1))
+    matches <- which(vapply(feature_prefixes, function(prefix) {
+        startsWith(column_name, prefix)
+    }, logical(1)))
+    if (length(matches) != 1L) {
+        stop("Cannot map PCA column back to one predictor: ", column_name)
+    }
+    selected_spec[[matches]]$feature
+}
+
+pca_feature_names <- vapply(rownames(pca$rotation), column_to_feature, character(1))
+axis_contributions <- data.table::rbindlist(lapply(1:2, function(j) {
+    data.table::data.table(
+        axis = paste0("PC", j, " (", sprintf("%.1f", variance_table$variance_pct[j]), "% variance)"),
+        feature = pca_feature_names,
+        squared_loading = pca$rotation[, j]^2
+    )[, .(axis_contribution_pct = 100 * sum(squared_loading)),
+      by = .(axis, feature)]
+}))
+data.table::setorder(axis_contributions, axis, -axis_contribution_pct)
+save_table_20(axis_contributions, "20_slide_pca_axis_contributions")
+
+axis_top <- axis_contributions[, head(.SD, 5L), by = axis]
+axis_top[, item := paste(axis, feature, sep = " | ")]
+axis_top[, item := factor(item, levels = rev(item))]
+axis_top[, axis_name := sub(" \\(.*$", "", axis)]
+
+p_axis <- ggplot2::ggplot(axis_top, ggplot2::aes(
+    x = item, y = axis_contribution_pct, fill = axis_name
+)) +
+    ggplot2::geom_col(width = .72, show.legend = FALSE) +
+    ggplot2::geom_text(ggplot2::aes(
+        label = sprintf("%.1f%%", axis_contribution_pct)
+    ), hjust = -.12, size = 3.6, color = palette_20[["dark"]]) +
+    ggplot2::coord_flip() +
+    ggplot2::facet_wrap(~axis, ncol = 2, scales = "free_x") +
+    ggplot2::scale_fill_manual(values = c(
+        PC1 = palette_20[["teal"]], PC2 = palette_20[["rust"]]
+    )) +
+    ggplot2::scale_x_discrete(labels = function(x) sub("^.* \\| ", "", x)) +
+    ggplot2::scale_y_continuous(
+        limits = c(0, 105), breaks = c(0, 25, 50, 75, 100),
+        expand = ggplot2::expansion(mult = c(0, .01))
+    ) +
+    plot_theme_20() +
+    ggplot2::theme(panel.grid.major.y = ggplot2::element_blank(),
+                   strip.text = ggplot2::element_text(face = "bold")) +
+    ggplot2::labs(
+        title = "What drives the two visible PCA axes?",
+        subtitle = "Shares of squared PCA loadings, grouped by original predictor",
+        x = NULL, y = "Contribution to this PCA axis (%)",
+        caption = "PCA was fitted on 2023 predictor data only; FMD was not included.\nThese are axis contributions, not effects on mental distress."
+    )
+save_plot_20(p_axis, "20_slide_pca_axes_explained", 13.5, 5.7)
+print(axis_contributions[feature %in% c(
+    "Physically unhealthy days", "Exercise in past 30 days")])
+```
+
+### Figure B — PCA projection as comparable small multiples
+
+Rather than coloring all years on top of each other (where almost everything overlaps), separate the year panels while using **one shared 2023 PCA coordinate system**. Colors show the frozen health profiles; larger outlined points indicate unweighted plotted-profile centroids. Point sampling is visual only: it does not change fitted models or summary percentages.
+
+```{r slide-pca-panels-by-year}
+set.seed(2042L)
+all_year_indices <- split(seq_len(nrow(analysis)), analysis$YEAR)
+panel_indices <- unlist(lapply(all_year_indices, function(ids) {
+    sample(ids, size = min(1200L, length(ids)))
+}), use.names = FALSE)
+plot_by_year <- analysis[panel_indices]
+profile_centroids <- analysis[, .(
+    PC1 = mean(PC1), PC2 = mean(PC2)
+), by = .(YEAR, cluster)]
+
+p_panels <- ggplot2::ggplot(
+    plot_by_year, ggplot2::aes(PC1, PC2, color = cluster)
+) +
+    ggplot2::geom_point(size = .85, alpha = .33) +
+    ggplot2::geom_point(
+        data = profile_centroids,
+        mapping = ggplot2::aes(PC1, PC2, fill = cluster),
+        inherit.aes = FALSE, shape = 21, color = "white",
+        stroke = 1.1, size = 4
+    ) +
+    ggplot2::facet_wrap(~YEAR, nrow = 1) +
+    ggplot2::scale_color_manual(values = profile_colors) +
+    ggplot2::scale_fill_manual(values = profile_colors, guide = "none") +
+    ggplot2::labs(
+        title = "Two physical-health profiles appear across all three survey years",
+        subtitle = "The same 2023 PCA projection and profile definitions are used each year",
+        x = paste0("PC1 (", sprintf("%.1f", variance_table$variance_pct[1]),
+                   "% of variance) • largely physically unhealthy days"),
+        y = paste0("PC2 (", sprintf("%.1f", variance_table$variance_pct[2]),
+                   "% of variance) • largely exercise response"),
+        color = "2023-derived profile",
+        caption = "Points are a fixed unweighted random sample per year; outlined circles mark profile centroids.\nDifferent respondents each year. FMD was not used to fit the PCA or clusters."
+    ) +
+    plot_theme_20() +
+    ggplot2::theme(
+        strip.text = ggplot2::element_text(face = "bold", size = 12),
+        panel.grid.minor = ggplot2::element_blank(),
+        legend.position = "bottom"
+    )
+save_plot_20(p_panels, "20_slide_pca_profile_panels_by_year", 14, 5.6)
+```
+
+### Figure C — What actually differs between the two profiles?
+
+For interpretability, this compares several **original observed responses** in 2023, not the post-imputation indicator matrix. Rates use nonmissing responses to each specific question. `DIFFWALK = 1` indicates walking difficulty; `MEDCOST1 = 1` indicates respondents could not see a doctor because of cost. Verify these labels against your version-specific BRFSS codebooks before final submission.
+
+```{r slide-profile-description-2023}
+# Original source rows remain aligned with 'analysis' because rows were not reordered.
+get_original_feature <- function(source_name) {
+    idx <- which(vapply(features, function(f) {
+        identical(f$source, source_name)
+    }, logical(1)))
+    if (length(idx) != 1L) stop("Expected one feature for: ", source_name)
+    clean_feature(raw, features[[idx]])
+}
+raw_health <- get_original_feature("GENHLTH")
+raw_walking <- get_original_feature("DIFFWALK")
+raw_medcost <- get_original_feature("MEDCOST1")
+
+profile_original <- data.table::data.table(
+    YEAR = analysis$YEAR,
+    cluster = analysis$cluster,
+    RAW_WEIGHT = analysis$RAW_WEIGHT,
+    general_health_raw = raw_health,
+    walking_raw = raw_walking,
+    medical_cost_raw = raw_medcost
+)
+profile_rates <- profile_original[YEAR == 2023L, .(
+    `Fair or poor general health` = 100 * weighted_mean_20(
+        ifelse(is.na(general_health_raw), NA_real_,
+               as.numeric(general_health_raw %in% c(4, 5))), RAW_WEIGHT),
+    `Difficulty walking` = 100 * weighted_mean_20(
+        ifelse(is.na(walking_raw), NA_real_,
+               as.numeric(walking_raw == 1)), RAW_WEIGHT),
+    `Could not afford medical care` = 100 * weighted_mean_20(
+        ifelse(is.na(medical_cost_raw), NA_real_,
+               as.numeric(medical_cost_raw == 1)), RAW_WEIGHT)
+), by = cluster]
+profile_rates_long <- data.table::melt(
+    profile_rates,
+    id.vars = "cluster", variable.name = "characteristic", value.name = "weighted_pct"
+)
+profile_rates_wide <- data.table::dcast(
+    profile_rates_long, characteristic ~ cluster,
+    value.var = "weighted_pct"
+)
+save_table_20(profile_rates, "20_slide_profile_original_response_rates_2023")
+
+p_characteristics <- ggplot2::ggplot() +
+    ggplot2::geom_segment(
+        data = profile_rates_wide,
+        mapping = ggplot2::aes(x = `Profile 1`, xend = `Profile 2`,
+                               y = characteristic, yend = characteristic),
+        linewidth = 1.0, color = "#D2D2CF"
+    ) +
+    ggplot2::geom_point(
+        data = profile_rates_long,
+        mapping = ggplot2::aes(x = weighted_pct,
+                               y = characteristic, color = cluster),
+        size = 4
+    ) +
+    ggplot2::geom_text(
+        data = profile_rates_long,
+        mapping = ggplot2::aes(x = weighted_pct,
+                               y = characteristic, label = sprintf("%.1f%%", weighted_pct),
+                               color = cluster),
+        vjust = -1, size = 3.6, show.legend = FALSE
+    ) +
+    ggplot2::scale_color_manual(values = profile_colors) +
+    ggplot2::scale_x_continuous(
+        limits = c(0, 85), breaks = seq(0, 80, 20),
+        labels = function(x) paste0(x, "%")
+    ) +
+    plot_theme_20() +
+    ggplot2::theme(panel.grid.major.y = ggplot2::element_blank()) +
+    ggplot2::labs(
+        title = "How the two 2023 profiles differ",
+        subtitle = "A survey-weighted description of original, observed responses",
+        x = "Respondents reporting the characteristic (%)", y = NULL,
+        color = "2023-derived profile",
+        caption = "Profile 1 averaged 1.4 physically unhealthy days; Profile 2 averaged 25.3.\nPercentages exclude missing responses to each corresponding item."
+    )
+save_plot_20(p_characteristics, "20_slide_profile_characteristics_2023", 12.5, 5.1)
+```
+
+### Figure D — Make the FMD result the visual centerpiece
+
+Directly label the observed FMD prevalences instead of asking viewers to infer values from bar heights. The same frozen 2023 cluster assignment recipe is used in 2024 and 2025. Connecting the annual estimates is a presentation device, **not an indication that the same individuals were followed over time**.
+
+```{r slide-fmd-direct-labels}
+gap_2025 <- posthoc_fmd[YEAR == 2025L,
+    weighted_fmd_pct[cluster == "Profile 2"] -
+    weighted_fmd_pct[cluster == "Profile 1"]
+]
+
+p_fmd_presentation <- ggplot2::ggplot(
+    posthoc_fmd,
+    ggplot2::aes(x = YEAR, y = weighted_fmd_pct,
+                 color = cluster, group = cluster)
+) +
+    ggplot2::geom_line(linewidth = 1.15) +
+    ggplot2::geom_point(size = 3.4) +
+    ggplot2::geom_text(
+        ggplot2::aes(label = sprintf("%.1f%%", weighted_fmd_pct),
+                     vjust = ifelse(cluster == "Profile 2", -1.1, 1.8)),
+        size = 4.1, show.legend = FALSE
+    ) +
+    ggplot2::scale_x_continuous(breaks = 2023:2025, limits = c(2022.85, 2025.2)) +
+    ggplot2::scale_y_continuous(
+        limits = c(0, 58), breaks = seq(0, 50, 10),
+        labels = function(x) paste0(x, "%")
+    ) +
+    ggplot2::scale_color_manual(values = profile_colors) +
+    plot_theme_20() +
+    ggplot2::theme(panel.grid.minor = ggplot2::element_blank()) +
+    ggplot2::labs(
+        title = "FMD prevalence remained much higher in Profile 2",
+        subtitle = paste0("2025 difference: ", sprintf("%.1f", gap_2025),
+                          " percentage points | FMD was excluded from clustering"),
+        x = "Survey year", y = "Survey-weighted FMD prevalence (%)",
+        color = "2023-derived profile",
+        caption = "Different respondents each year. Descriptive weighted point estimates only;\nno uncertainty intervals or causal interpretation implied."
+    )
+save_plot_20(p_fmd_presentation, "20_slide_fmd_by_profile_direct_labels", 11.8, 6.2)
+```
+
+**Slide pairing suggested:** For a 15-minute presentation, use **Figure A** (PCA-axis explanation) next to a small crop of **Figure B** on the PCA slide, then use **Figure D** (FMD by profile) as the main visual on the clustering slide. **Figure C** can serve as a small inset or backup slide. If only two figures will fit, use B and D, and put the PC1/PC2 interpretation into text bullets.
+
+## 10 — Reproducibility and limitations
+
+```{r run-manifest}
+manifest <- data.table::data.table(
+    source_file = source_file,
+    input_md5 = source_md5,
+    source_rows_after_weight_check = nrow(raw),
+    source_columns = ncol(raw),
+    retained_feature_groups = length(selected_features),
+    retained_encoded_columns = ncol(X),
+    train_2023_respondents = length(train_index),
+    cluster_count = chosen_k,
+    seed = 42L,
+    fit_year = 2023L,
+    fmd_used_in_clustering = FALSE,
+    race_used_in_clustering = FALSE,
+    sampling_weights_in_clustering = FALSE,
+    descriptive_weights = "BRFSS _LLCPWT; weighted point estimates only",
+    missing_data_strategy = "2023 median/mode imputation; missingness audited"
+)
+save_table_20(manifest, "20_run_manifest")
+session_path <- file.path(output_root, "20_session_info.txt")
+capture.output(sessionInfo(), file = session_path)
+cat("[COMPLETE] Explore figures and tables in:", output_root, "\n")
+```
+
+### Interpretation safeguards
+
+- The source is a pre-filtered AI/AN-only dataset. **Verify how the AI/AN-alone cohort was constructed** from the original year-specific race items before publishing population claims; the notebook prints relevant race-code distributions for this audit.
+- **Original BRFSS codes vary by question and year.** Check the year-specific CDC codebooks against the exported candidate dictionary. The analysis uses a prespecified subset, not all 449 raw variables as predictors.
+- Optional items that are only asked in some states or years will typically fail the year-specific coverage rule and be excluded. The coverage audit shows this explicitly.
+- Median/mode imputation lets clustering use all positive-weight respondents, but can obscure meaningful missingness differences. The source and imputation audits should be reported alongside profiles.
+- Domain balancing, numeric scaling, one-hot encoding, k-means, and the chosen number of profiles are modeling decisions, not discoveries about inherent population types. Stability tests using different feature groups, scaling, and cluster counts would strengthen the research.
+- PCA and k-means are unweighted exploratory analyses. **The descriptive percentages are weighted, but no BRFSS complex-sampling confidence intervals are computed here.** The 2024 and 2025 results are repeated cross-sectional comparisons, not follow-up of the same respondents.
+- FMD is defined from the original `MENTHLTH` questionnaire item, and **is only examined after clustering**. It is contemporaneous with many health variables; profile differences cannot demonstrate causation or predict future crises.
+- The analysis does not prescribe individual services or characterize particular Tribal Nations. Any possible public-health application would require additional validation, relevant local data, and Tribal governance of research questions and data use.

@@ -1,0 +1,347 @@
+---
+title: "15 — Does predictor information change in later survey years?"
+output: html_notebook
+---
+
+**Research question:**
+Which physical and social/demographic predictors does the frozen national model rely on in
+2023, 2024, and 2025, and does their usefulness change across years?
+
+**Measures:** survey-weighted increase in Brier error after shuffling each
+predictor, using an identically frozen 2014–2022 model in each year. Also reports the
+weighted FMD rate within selected predictor categories. An association or a change in
+model reliance is **not** a causal relationship. The 2024 calibrator is not applied to
+the importance calculations so the same base classifier is compared in all three years.
+The 2025 results use the frozen model and are evaluated after model development.
+
+
+```{r setup}
+# Find the original RStudio project, regardless of the notebook's working directory.
+
+# -----------------------------------------------------------------------------
+# Project-root discovery
+# -----------------------------------------------------------------------------
+
+# Search upward for the project marker so notebook paths do not depend on a particular
+# subfolder.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    # Walk toward the filesystem root until the project marker is found.
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        # Move up one directory; an unchanged parent marks the filesystem root.
+        parent <- dirname(current)
+        if (identical(current, parent)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+
+# -----------------------------------------------------------------------------
+# Notebook execution root
+# -----------------------------------------------------------------------------
+
+# Resolve the project before loading modules; configure subsequent knitr chunks to use
+# that root.
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+# Read the executable code blocks from existing shared R Notebooks.
+
+# -----------------------------------------------------------------------------
+# Shared-module loader
+# -----------------------------------------------------------------------------
+
+# Extract R chunks in source order and evaluate them in the caller environment.
+# This lightweight loader does not process chunk options such as eval = FALSE.
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    lines <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+    blocks <- lapply(starts, function(start) {
+        # Use the next standalone closing fence for this R chunk.
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Incomplete R code chunk in ", path)
+        }
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+
+# -----------------------------------------------------------------------------
+# Shared settings and utilities
+# -----------------------------------------------------------------------------
+
+# Load configuration before helpers, retaining the existing presentation palette module.
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+load_module("addon_insight_helpers")
+
+# -----------------------------------------------------------------------------
+# Existing-run attachment
+# -----------------------------------------------------------------------------
+
+# Attach to an allocated run rather than incrementing the counter in this stage.
+run_context <- attach_run()
+# Resolve the frozen model run separately from the current output run.
+source_run_id <- get_source_run_id()
+cat("[ADD-ON] New increment:", run_context$id, "| Original model run:", source_run_id, "\n")
+```
+
+
+## Load the frozen model and three annual evaluations
+
+Each year's predictors were encoded by the original pipeline. No model fitting or
+feature engineering is repeated here.
+
+```{r load-later-years}
+# -----------------------------------------------------------------------------
+# Original model and annual checkpoints
+# -----------------------------------------------------------------------------
+
+# Read the frozen base model and existing year-specific features from the source run.
+# Keep additional outputs separate from the fitted model artifacts.
+
+# Load the selected original model and the distinct survey-year checkpoints.
+source_model <- get_source_model()
+fitted <- source_model$fitted
+
+year_2023 <- load_source_rds("checkpoints", "02_selection_2023")
+year_2024 <- load_source_rds("checkpoints", "02_calibration_2024")
+year_2025 <- load_source_rds("checkpoints", "07_scored_2025")
+
+annual_data <- list(
+    `2023` = year_2023,
+    `2024` = year_2024,
+    `2025` = year_2025
+)
+cat("[SOURCE MODEL]", source_model$selection$chosen_family, "\n")
+```
+
+## Compare survey-weighted predictor reliance
+
+For speed, each year retains all available AI/AN-alone records while taking a
+reproducible comparison-group sample. Inverse sampling fractions correct the weights for
+the sampling stage. Independent shuffling estimates **marginal predictive reliance**,
+which can be misleading for strongly correlated factors.
+
+```{r permutation-by-year}
+# -----------------------------------------------------------------------------
+# Annual fixed-model predictor reliance
+# -----------------------------------------------------------------------------
+
+# Retain AI/AN records and subsample other cohorts with inverse-fraction weight
+# adjustments.
+# Compare the same uncalibrated classifier across years without refitting it.
+
+# Choose a limited comparison sample but keep all AI/AN records in each year.
+sample_for_importance <- function(data, year) {
+    eligible <- data.table::copy(data.table::as.data.table(data))[
+        valid_outcome(FMD) & valid_weight(RAW_WEIGHT)
+    ]
+    set.seed(seed + as.integer(year) + 1500L)
+    pieces <- lapply(unique(eligible$cohort), function(group) {
+        group_data <- eligible[cohort == group]
+        maximum <- if (group == primary_groups[1]) {
+            nrow(group_data)
+        } else if (group == primary_groups[2]) {
+            35000L
+        } else {
+            4000L
+        }
+        chosen_n <- min(nrow(group_data), maximum)
+        choices <- sample.int(nrow(group_data), size = chosen_n)
+        sampled <- group_data[choices]
+        sampled[, analysis_weight := RAW_WEIGHT * nrow(group_data) / chosen_n]
+        sampled
+    })
+    data.table::rbindlist(pieces)
+}
+
+# Evaluate the SAME model without a new 2025-informed parameter choice.
+importance_rows <- list()
+model_baselines <- list()
+row_id <- 0L
+
+# Iterate through the configured analysis items in the original execution order.
+for (year in names(annual_data)) {
+    sample_data <- sample_for_importance(annual_data[[year]], year)
+    original_probabilities <- predict_classifier(fitted, sample_data)
+    baseline <- weighted_metrics(
+        sample_data$FMD,
+        original_probabilities,
+        sample_data$analysis_weight
+    )
+    model_baselines[[year]] <- data.frame(
+        YEAR = as.integer(year),
+        respondents = nrow(sample_data),
+        baseline_brier = baseline$brier,
+        baseline_auc = baseline$auc
+    )
+
+    for (feature in feature_names) {
+        for (replicate in seq_len(if (run_mode == "quick") 3L else 7L)) {
+            changed <- data.table::copy(sample_data)
+            data.table::set(
+                changed,
+                j = feature,
+                value = sample(changed[[feature]], size = nrow(changed))
+            )
+            new_probabilities <- predict_classifier(fitted, changed)
+            new_brier <- weighted_mean(
+                (changed$FMD - new_probabilities)^2,
+                changed$analysis_weight
+            )
+            row_id <- row_id + 1L
+            importance_rows[[row_id]] <- data.frame(
+                YEAR = as.integer(year),
+                feature = feature,
+                replicate = replicate,
+                baseline_brier = baseline$brier,
+                permuted_brier = new_brier,
+                brier_increase = new_brier - baseline$brier,
+                relative_brier_increase = (new_brier - baseline$brier) / baseline$brier
+            )
+        }
+    }
+    cat("[COMPLETE]  Year:", year, "| input sample:", nrow(sample_data), "\n")
+}
+
+permutations <- data.table::rbindlist(importance_rows)
+importance <- permutations[, .(
+    mean_brier_increase = mean(brier_increase),
+    mean_relative_increase = mean(relative_brier_increase),
+    min_relative_increase = min(relative_brier_increase),
+    max_relative_increase = max(relative_brier_increase)
+), by = .(YEAR, feature)]
+
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(data.table::rbindlist(model_baselines), "15_base_model_performance_by_year")
+save_table(permutations, "15_yearly_permutation_replicates")
+save_table(importance, "15_yearly_predictor_reliance")
+print(importance[order(YEAR, -mean_relative_increase)])
+```
+
+## Show changing model reliance
+
+**Measures:** the change in relative Brier deterioration when shuffling a
+predictor. Differences can reflect a combination of predictive relationships,
+prevalence, sample composition, and correlations between inputs.
+
+```{r show-reliance}
+# -----------------------------------------------------------------------------
+# Changes in relative predictor reliance
+# -----------------------------------------------------------------------------
+
+# Compare relative Brier deterioration across the three survey years.
+# Differences can reflect prevalence, composition, associations, and predictor
+# correlations.
+
+# The graph is printed in this notebook before being saved to the new run folder.
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+
+
+# Build the chart using the existing palette and theme; retain the original scales and
+# labels.
+reliance_plot <- ggplot2::ggplot(
+    importance,
+    ggplot2::aes(x = YEAR, y = mean_relative_increase, color = feature)
+) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point() +
+    ggplot2::scale_x_continuous(breaks = 2023:2025) +
+    ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    atg_scale_color_features() +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Frozen-model predictor reliance across later survey years",
+        subtitle = "Increase in weighted Brier error after marginal permutation",
+        x = "Survey year",
+        y = "Relative deterioration of Brier score",
+        color = "Predictor",
+        caption = "2025 findings are exploratory; reliance is not a causal effect."
+    )
+show_and_save(reliance_plot, "15_yearly_permutation_signal", 11, 6)
+```
+
+## Examine observed FMD by predictor category
+
+**Measures:** annual population-weighted rates of FMD within reported physical
+health and household-income categories. This helps distinguish a changing predictor
+distribution from a changing outcome association. Reported missing responses remain
+their own category.
+
+```{r observed-category-rates}
+# -----------------------------------------------------------------------------
+# Observed outcomes within predictor categories
+# -----------------------------------------------------------------------------
+
+# Use all eligible primary-group records rather than the smaller importance samples.
+# Calculate weighted within-category rates without adjustment for other predictors.
+
+# Use all eligible respondents (not just the model-importance samples).
+rate_rows <- list()
+
+# Iterate through the configured analysis items in the original execution order.
+for (year in names(annual_data)) {
+    eligible <- data.table::as.data.table(annual_data[[year]])[
+        valid_outcome(FMD) & valid_weight(RAW_WEIGHT) & cohort %in% primary_groups
+    ]
+    for (variable in c("physical_days_group", "INCOME_BAND")) {
+        grouped <- eligible[, .(
+            n = .N,
+            weighted_numerator = sum(FMD * RAW_WEIGHT),
+            weighted_denominator = sum(RAW_WEIGHT),
+            observed_fmd = weighted_mean(FMD, RAW_WEIGHT)
+        ), by = .(cohort, category = as.character(get(variable)))]
+        grouped[, `:=`(YEAR = as.integer(year), feature = variable)]
+        rate_rows[[length(rate_rows) + 1L]] <- grouped
+    }
+}
+category_rates <- data.table::rbindlist(rate_rows)
+
+# Save this result under the attached run ID so it remains linked to the current
+# analysis.
+save_table(category_rates, "15_yearly_fmd_by_predictor_category")
+print(category_rates[order(feature, cohort, YEAR, category)])
+
+# Two facets keep both predictor-category rates legible within the notebook.
+
+# Iterate through the configured analysis items in the original execution order.
+for (variable in c("physical_days_group", "INCOME_BAND")) {
+    chart_data <- category_rates[feature == variable]
+    category_plot <- ggplot2::ggplot(
+        chart_data,
+        ggplot2::aes(x = factor(YEAR), y = observed_fmd, fill = category)
+    ) +
+        ggplot2::geom_col(position = "dodge") +
+        ggplot2::facet_wrap(~cohort) +
+        ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+        atg_scale_fill_categories(chart_data$category) +
+        atg_theme() +
+        ggplot2::labs(
+            title = paste("Observed FMD by", variable, "category"),
+            subtitle = "Survey-weighted within-category rates; no adjustment for other factors",
+            x = "Survey year",
+            y = "Observed frequent mental distress",
+            fill = "Category",
+            caption = "Small category sample sizes can produce unstable observed rates."
+        )
+    show_and_save(category_plot, paste0("15_outcome_by_", variable), 11, 6)
+}
+```

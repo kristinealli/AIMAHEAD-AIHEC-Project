@@ -1,0 +1,443 @@
+---
+title: "11 — Annual mental distress and predictor distribution shifts"
+output: html_notebook
+---
+
+**Measures:** annual survey-weighted frequent mental distress (2014–2025) and the distribution of each predictor during 2022–2025. This examines temporal changes that might affect generalization. It is *descriptive* and does not select or retrain models.
+
+## Setup
+
+Loads the unchanged input settings, shared model functions, and the persistent run increment. The output suffix identifies this run.
+
+```{r setup}
+# Set the project root, then load R code from the shared R Notebooks.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio first")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+run_context <- attach_run()
+cat("[RUN] Current increment:", run_context$id, "\n")
+```
+
+
+
+## Annual FMD trends
+
+Compares reported FMD across years, showing patterns independently of model performance. The historical audit now contains additional confidence-interval and sample-size columns, while the 2025 checkpoint produces a simpler prevalence table. This notebook deliberately harmonizes the four comparable fields (`YEAR`, `cohort`, `observed_fmd`, and `n`) before combining years. The graph shows **point estimates only**; historical confidence intervals remain available in the annual audit output and should not be invented for 2025. The graph is printed in this notebook and saved with the increment suffix.
+
+```{r annual-fmd-trend}
+# Read existing annual historical estimates. The updated Audit notebook
+# also saves standard errors, confidence intervals, and effective sample
+# sizes, so we select only the fields needed for this 2014–2025 trend.
+history_path <- artifact_path("tables", "01_annual_fmd_prevalence", "csv")
+annual_history <- data.table::fread(history_path)
+
+# Older audit runs may call the unweighted group count "respondents".
+# Support both names without altering the source results.
+if (!"n" %in% names(annual_history) && "respondents" %in% names(annual_history)) {
+    data.table::setnames(annual_history, "respondents", "n")
+}
+
+required_columns <- c("YEAR", "cohort", "observed_fmd", "n")
+missing_columns <- setdiff(required_columns, names(annual_history))
+if (length(missing_columns) > 0L) {
+    stop(
+        "Historical annual prevalence table is missing: ",
+        paste(missing_columns, collapse = ", ")
+    )
+}
+
+annual_history <- annual_history[
+    ,
+    .(
+        YEAR = as.integer(YEAR),
+        cohort = as.character(cohort),
+        observed_fmd = as.numeric(observed_fmd),
+        n = as.integer(n)
+    )
+]
+
+# The 2025 scored checkpoint retains the entire original test-year file.
+# Calculate 2025 prevalence with that year's own survey weights.
+scored <- load_run_rds("checkpoints", "07_scored_2025")
+annual_test <- scored[
+    valid_outcome(FMD) &
+        valid_weight(RAW_WEIGHT) &
+        cohort %in% primary_groups,
+    .(
+        observed_fmd = weighted_mean(FMD, RAW_WEIGHT),
+        n = .N
+    ),
+    by = .(YEAR, cohort)
+]
+
+# Match column names and types explicitly before binding. Do not use
+# fill = TRUE to silently create missing 2025 confidence intervals.
+annual_test <- annual_test[, ..required_columns]
+annual_all <- data.table::rbindlist(
+    list(annual_history, annual_test),
+    use.names = TRUE
+)
+
+data.table::setorder(annual_all, cohort, YEAR)
+save_table(annual_all, "11_annual_fmd_2014_2025")
+print(annual_all)
+
+# A changing survey population may shift prevalence even without any causal effect.
+trend_plot <- ggplot2::ggplot(
+    annual_all,
+    ggplot2::aes(x = YEAR, y = observed_fmd, color = cohort)
+) +
+    ggplot2::geom_line() +
+    ggplot2::geom_point() +
+    ggplot2::geom_vline(xintercept = 2020, linetype = "dashed", color = atg_palette[["gold"]]) +
+    ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    ggplot2::scale_x_continuous(breaks = 2014:2025) +
+    atg_scale_color_groups() +
+    atg_theme() +
+    ggplot2::labs(
+        title = "Observed frequent mental distress across survey years",
+        subtitle = "Annual survey-weighted rates; dashed marker at 2020 is descriptive",
+        x = "Survey year",
+        y = "Frequent mental distress prevalence",
+        color = "Population",
+        caption = "Repeated cross-sectional data; changing state coverage and population response may matter."
+    )
+show_and_save(trend_plot, "11_annual_fmd_2014_2025", 11, 6)
+```
+
+
+## Predictor distribution changes
+
+Compares the weighted proportions in each predictor category across recent years; the visible example highlights income and its explicit `Missing` category. Variables may change because of survey participation or harmonization.
+
+```{r predictor-shifts}
+# Inspect only the late-development and subsequent evaluation years.
+# The 2025 features are scored already; the source dataset is never modified.
+historical <- read_historical()
+historical <- historical[
+    YEAR %in% c(2022L, 2023L, 2024L) & valid_weight(RAW_WEIGHT),
+    .(
+        YEAR, RAW_WEIGHT, FMD, AIAN_ALONE, PHYSHLTH_DAYS,
+        GENHLTH_CLEAN, AGE_BAND, SEX_CLEAN, EDU_CLEAN, INCOME_BAND
+    )
+]
+historical <- prepare_features(historical)
+late_years <- data.table::rbindlist(list(
+    historical[, c("YEAR", "RAW_WEIGHT", "FMD", "cohort", feature_names), with = FALSE],
+    scored[, c("YEAR", "RAW_WEIGHT", "FMD", "cohort", feature_names), with = FALSE]
+))
+rm(historical)
+gc(verbose = FALSE)
+
+# Every estimate is weighted within its *own year*, not across pooled years.
+# Weighted category shares can reveal drift in input distributions.
+shift_rows <- list()
+row_number <- 0L
+for (variable in feature_names) {
+    annual <- late_years[, .(
+        weighted_total = sum(RAW_WEIGHT),
+        respondents = .N
+    ), by = .(YEAR, cohort, category = as.character(get(variable)))]
+    annual[, weighted_share := weighted_total / sum(weighted_total), by = .(YEAR, cohort)]
+    annual[, variable := variable]
+    row_number <- row_number + 1L
+    shift_rows[[row_number]] <- annual
+}
+shift_table <- data.table::rbindlist(shift_rows)
+save_table(shift_table, "11_predictor_distributions_2022_2025")
+
+# Focus the preview on income response categories and missingness.
+income <- shift_table[
+    variable == "INCOME_BAND" & cohort %in% primary_groups & YEAR %in% c(2023L, 2025L)
+]
+print(income[order(cohort, YEAR, category)])
+
+
+# ------------------------------------------------------------
+# Compare income-category distributions, 2023 versus 2025
+# ------------------------------------------------------------
+
+# Convert the existing long table into one row per
+# population and income category, with a column for
+# each survey year.
+
+income_plot <- data.table::dcast(
+    income,
+    cohort + category ~ YEAR,
+    value.var = "weighted_share"
+)
+
+# Give the annual share columns descriptive names.
+data.table::setnames(
+    income_plot,
+    old = c("2023", "2025"),
+    new = c("share_2023", "share_2025")
+)
+
+# Calculate the change in percentage points.
+# Positive values indicate a larger share in 2025.
+income_plot[
+    ,
+    change_pp := 100 * (share_2025 - share_2023)
+]
+
+# Validate that both survey years are represented.
+stopifnot(
+    !anyNA(income_plot$share_2023),
+    !anyNA(income_plot$share_2025),
+    all(is.finite(income_plot$change_pp))
+)
+
+# Order income categories logically rather than
+# alphabetically. Reversed levels display the lowest
+# income category at the top of a horizontal chart.
+income_plot[
+    ,
+    category := factor(
+        category,
+        levels = rev(c(
+            "<25k",
+            "25-49k",
+            "50-74k",
+            "75k+",
+            "Missing"
+        ))
+    )
+]
+
+# Ensure each group uses the same income categories.
+stopifnot(!anyNA(income_plot$category))
+
+# Save the exact comparison values.
+save_table(
+    income_plot,
+    "11_income_distribution_change_2023_2025"
+)
+
+print(income_plot[order(cohort, category)])
+
+# Provide room for numeric change annotations.
+x_max <- max(
+    income_plot$share_2023,
+    income_plot$share_2025
+) + 0.065
+
+# ------------------------------------------------------------
+# Visualization: paired income-distribution estimates
+# ------------------------------------------------------------
+
+shift_plot <- ggplot2::ggplot(
+    income_plot,
+    ggplot2::aes(y = category)
+) +
+    # Connect each category's 2023 and 2025 shares.
+    ggplot2::geom_segment(
+        ggplot2::aes(
+            x = share_2023,
+            xend = share_2025,
+            yend = category
+        ),
+        color = atg_palette[["gold"]],
+        linewidth = 1.2
+    ) +
+    # 2023 estimated share.
+    ggplot2::geom_point(
+        ggplot2::aes(
+            x = share_2023,
+            color = "2023"
+        ),
+        size = 3.5
+    ) +
+    # 2025 estimated share.
+    ggplot2::geom_point(
+        ggplot2::aes(
+            x = share_2025,
+            color = "2025"
+        ),
+        size = 3.5
+    ) +
+    # Show the exact percentage-point difference.
+    ggplot2::geom_text(
+        ggplot2::aes(
+            x = pmax(share_2023, share_2025) + 0.015,
+            label = sprintf("%+.1f pp", change_pp)
+        ),
+        hjust = 0,
+        size = 3.3,
+        color = atg_palette[["gold"]]
+    ) +
+    # Compare population groups in separate panels.
+    ggplot2::facet_wrap(
+        ~cohort,
+        nrow = 1
+    ) +
+    ggplot2::scale_color_manual(
+        values = c(
+            "2023" = atg_year_colors[["2023"]],
+            "2025" = atg_year_colors[["2025"]]
+        )
+    ) +
+    ggplot2::scale_x_continuous(
+        labels = scales::percent_format(accuracy = 1),
+        breaks = seq(0, 0.50, by = 0.10)
+    ) +
+    ggplot2::coord_cartesian(
+        xlim = c(0, x_max)
+    ) +
+    atg_theme() +
+    ggplot2::theme(
+        legend.position = "bottom",
+        strip.text = ggplot2::element_text(
+            face = "bold",
+            size = 11
+        ),
+        plot.caption = ggplot2::element_text(
+            size = 8,
+            hjust = 0,
+            margin = ggplot2::margin(t = 12)
+        )
+    ) +
+    ggplot2::labs(
+        title = "How did income distributions shift between 2023 and 2025?",
+        subtitle = paste(
+            "Survey-weighted income-category shares",
+            "by population"
+        ),
+        x = "Weighted respondent share",
+        y = "Household income category",
+        color = "Survey year",
+        caption = paste(
+            "Labels show the 2025 minus 2023 difference",
+            "in percentage points.",
+            "Income bands are nominal and include missing responses.",
+            "\nDescriptive changes do not establish population trends",
+            "or statistically significant differences."
+        )
+    )
+
+show_and_save(
+    shift_plot,
+    "11_income_distribution_shift_dumbbell",
+    12,
+    6
+)
+
+```
+```{r}
+
+# ------------------------------------------------------------
+# Visualize income distribution changes by population
+# ------------------------------------------------------------
+
+# Positive values indicate a larger weighted share in 2025.
+# Negative values indicate a smaller weighted share in 2025.
+# These are descriptive differences, not significance tests.
+
+shift_plot <- ggplot2::ggplot(
+    income_plot,
+    ggplot2::aes(
+        x = change_pp,
+        y = category,
+        color = cohort
+    )
+) +
+    ggplot2::geom_vline(
+        xintercept = 0,
+        linetype = "dashed",
+        color = atg_palette[["mauve"]],
+        linewidth = 0.8
+    ) +
+    ggplot2::geom_segment(
+        ggplot2::aes(
+            x = 0,
+            xend = change_pp,
+            yend = category
+        ),
+        linewidth = 1.3
+    ) +
+    ggplot2::geom_point(
+        size = 3.5
+    ) +
+    ggplot2::geom_text(
+        ggplot2::aes(
+            x = change_pp + ifelse(change_pp >= 0, 0.2, -0.2),
+            label = sprintf("%+.1f pp", change_pp),
+            hjust = ifelse(change_pp >= 0, 0, 1)
+        ),
+        color = atg_palette[["gold"]],
+        size = 3.5
+    ) +
+    ggplot2::facet_wrap(
+        ~cohort,
+        nrow = 1
+    ) +
+    ggplot2::scale_x_continuous(
+        labels = function(x) sprintf("%+g pp", x),
+        expand = ggplot2::expansion(add = 1)
+    ) +
+    atg_scale_color_groups() +
+    atg_theme() +
+    ggplot2::theme(
+        legend.position = "none",
+        strip.text = ggplot2::element_text(
+            face = "bold"
+        ),
+        plot.caption = ggplot2::element_text(
+            size = 8,
+            hjust = 0
+        )
+    ) +
+    ggplot2::labs(
+        title = "How did income distributions shift from 2023 to 2025?",
+        subtitle = "Change in survey-weighted income-category shares",
+        x = "Change in weighted share (percentage points)",
+        y = "Household income category",
+        caption = paste(
+            "Positive = larger share in 2025; negative = smaller share.",
+            "\nDescriptive estimates only; income bands are not inflation-adjusted.",
+            "Survey-design uncertainty is not shown."
+        )
+    )
+
+show_and_save(
+    shift_plot,
+    "11_income_distribution_change",
+    11,
+    5.5
+)
+
+```

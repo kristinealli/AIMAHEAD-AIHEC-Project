@@ -1,0 +1,168 @@
+---
+title: "Add-on helpers — frozen model and standardized comparisons"
+output: html_notebook
+---
+
+Functions used only by the additional research notebooks. These functions never
+refit or overwrite an existing classifier.
+
+## Locate the frozen study run
+
+The model and predictions come from the current numbered run when the master
+workflow is used. Standalone execution can still read a previously completed
+source run.
+
+```{r source-run-helpers}
+get_source_run_id <- function() {
+    source_id <- Sys.getenv("ATG_SOURCE_RUN_ID", unset = "")
+    if (!grepl("^[0-9]{4,}$", source_id)) {
+        stop("Run notebooks/14_Run_Additional_Insights.Rmd first")
+    }
+    source_id
+}
+
+source_run_path <- function(area, stem, extension = "rds") {
+    if (!area %in% c("models", "checkpoints", "tables")) {
+        stop("Unsupported original-run output folder: ", area)
+    }
+    source_id <- get_source_run_id()
+    path <- file.path(
+        project_root,
+        "outputs",
+        paste0("run_", source_id),
+        area,
+        sprintf("%s_run_%s.%s", stem, source_id, extension)
+    )
+    if (!file.exists(path)) {
+        stop("Source run artifact does not exist: ", path)
+    }
+    path
+}
+
+load_source_rds <- function(area, stem) {
+    readRDS(source_run_path(area, stem))
+}
+
+load_source_table <- function(stem) {
+    data.table::fread(source_run_path("tables", stem, "csv"))
+}
+
+get_source_model <- function() {
+    selected <- load_source_rds("models", "05_frozen_selection")
+    if (!selected$chosen_family %in% c("logistic", "lasso", "forest")) {
+        stop("Unexpected selected model family")
+    }
+    list(
+        selection = selected,
+        fitted = load_source_rds("models", paste0("05_", selected$chosen_family))
+    )
+}
+```
+
+## Weighted standardization and comparison
+
+Creates an equal-mixture target distribution for AI/AN-alone and other
+single-race respondents. The standardized weights are not original BRFSS
+probability weights and do not make the comparison causal.
+
+```{r composition-helpers}
+# Returns only cells with at least min_cell_n respondents from BOTH groups.
+# The same eligible cells can be reused in bootstrap replicates.
+find_common_cells <- function(data, cell_column, min_cell_n = 30L) {
+    counts <- data[cohort %in% primary_groups, .N, by = c("cohort", cell_column)]
+    cell_name <- as.character(counts[[cell_column]])
+    ai_cells <- cell_name[
+        counts$cohort == primary_groups[1] & counts$N >= min_cell_n
+    ]
+    other_cells <- cell_name[
+        counts$cohort == primary_groups[2] & counts$N >= min_cell_n
+    ]
+    intersect(ai_cells, other_cells)
+}
+
+# Recomputes the group-standardization factors from the supplied weights.
+# These factors make each group share the same age/sex target distribution.
+standardize_weights <- function(data, raw_weights, cell_column, common_cells) {
+    if (length(raw_weights) != nrow(data)) {
+        stop("Standardization weight vector length mismatch")
+    }
+    selected <- data.table::copy(data)
+    selected[, base_weight := as.numeric(raw_weights)]
+    selected <- selected[
+        cohort %in% primary_groups &
+            get(cell_column) %in% common_cells &
+            valid_weight(base_weight)
+    ]
+    if (nrow(selected) == 0L) {
+        stop("Standardization has no positive-weight observations")
+    }
+    distribution <- selected[, .(
+        total_weight = sum(base_weight)
+    ), by = c("cohort", cell_column)]
+    distribution[, share := total_weight / sum(total_weight), by = cohort]
+
+    # A common cell must retain positive weight in each replicate and group.
+    present <- distribution[, .N, by = cell_column]
+    if (any(present$N != 2L) || nrow(present) != length(common_cells)) {
+        stop("Bootstrap lost positivity in a standardization cell")
+    }
+
+    target <- distribution[, .(
+        target_share = mean(share)
+    ), by = cell_column]
+    distribution <- merge(
+        distribution,
+        target,
+        by = cell_column,
+        sort = FALSE
+    )
+    distribution[, adjustment := target_share / share]
+    if (any(!is.finite(distribution$adjustment))) {
+        stop("Invalid standardization factor")
+    }
+    selected <- merge(
+        selected,
+        distribution[, c("cohort", cell_column, "adjustment"), with = FALSE],
+        by = c("cohort", cell_column),
+        sort = FALSE
+    )
+    selected[, standardized_weight := base_weight * adjustment]
+    selected
+}
+
+# Includes an in-group constant-reference Brier skill for interpretation.
+# The reference uses the original historical training prevalence, not 2025 labels.
+score_groups <- function(data, weight_column, scenario, historical_prevalence) {
+    results <- lapply(primary_groups, function(group) {
+        subset <- data[cohort == group & valid_weight(get(weight_column))]
+        if (!nrow(subset)) {
+            stop("Empty subgroup for ", scenario, ": ", group)
+        }
+        weights <- subset[[weight_column]]
+        metrics <- weighted_metrics(
+            subset$FMD,
+            subset$selected_probability,
+            weights
+        )
+        reference <- weighted_metrics(
+            subset$FMD,
+            rep(historical_prevalence, nrow(subset)),
+            weights
+        )
+        data.frame(
+            scenario = scenario,
+            cohort = group,
+            metrics,
+            brier_skill_vs_historical = 1 - metrics$brier / reference$brier
+        )
+    })
+    data.table::rbindlist(results)
+}
+
+# Difference convention is always AI/AN minus other single-race.
+gap_from_metrics <- function(metrics, measure) {
+    ai_value <- metrics[cohort == primary_groups[1]][[measure]][1]
+    other_value <- metrics[cohort == primary_groups[2]][[measure]][1]
+    ai_value - other_value
+}
+```

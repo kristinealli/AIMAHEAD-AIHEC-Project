@@ -1,0 +1,69 @@
+---
+title: "Optional add-on synthetic test — demographic standardization"
+output: html_notebook
+---
+
+## Check the shared standardization helper
+
+```{r synthetic-standardization}
+# Load shared R notebook functions into this temporary test session.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(current, parent)) {
+            stop("Open the existing RStudio project first")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+load_module <- function(name) {
+    lines <- readLines(file.path(project_root, "R", paste0(name, ".Rmd")))
+    starts <- which(startsWith(lines, "```{r"))
+    ends <- which(trimws(lines) == "```")
+    code <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        paste(lines[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(code, collapse = "\n\n")), envir = parent.frame())
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("addon_insight_helpers")
+
+# Ensure the two groups have substantially different age shares before adjustment.
+mock <- data.table::data.table(
+    cohort = rep(primary_groups, each = 4L),
+    age_cell = rep(c("18-34", "18-34", "65+", "65+"), times = 2L),
+    FMD = rep(c(0L, 1L), times = 4L),
+    selected_probability = rep(c(0.2, 0.5), times = 4L),
+    RAW_WEIGHT = c(2, 2, 8, 8, 8, 8, 2, 2)
+)
+common_cells <- find_common_cells(mock, "age_cell", min_cell_n = 1L)
+stopifnot(setequal(common_cells, c("18-34", "65+")))
+
+standardized <- standardize_weights(
+    mock,
+    raw_weights = mock$RAW_WEIGHT,
+    cell_column = "age_cell",
+    common_cells = common_cells
+)
+post_shares <- standardized[, .(
+    weighted = sum(standardized_weight)
+), by = .(cohort, age_cell)]
+post_shares[, share := weighted / sum(weighted), by = cohort]
+first <- post_shares[cohort == primary_groups[1]][order(age_cell)]$share
+second <- post_shares[cohort == primary_groups[2]][order(age_cell)]$share
+stopifnot(all(abs(first - second) < 1e-10))
+stopifnot(abs(sum(first) - 1) < 1e-10)
+
+cat("[PASS] Both groups have an identical post-standardization age distribution.\n")
+```

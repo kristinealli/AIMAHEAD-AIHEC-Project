@@ -1,0 +1,362 @@
+---
+title: "18 — 2025 Confusion Matrices and Classification Thresholds"
+output: html_notebook
+---
+
+## Purpose
+
+**Question:** At a specified probability cutoff, how often does the frozen nationally selected model identify BRFSS 2025 respondents who reported frequent mental distress (FMD)? Does that classification behavior differ between AI/AN-alone adults and other identified single-race adults?
+
+This notebook uses the **existing run 0017 scored respondents** saved by Notebook 07. It does **not** train, tune, recalibrate, or reselect a model.
+
+- **Actual FMD = 1:** The respondent reported 14 or more mentally unhealthy days in the previous 30 days.
+- **Predicted FMD = 1:** The saved model probability is **greater than or equal to** the specified threshold.
+- **Thresholds 0.16, 0.20, and 0.50:** Fixed illustrative cutoffs applied identically to all populations. They are **not** optimized against the 2025 outcomes and **not** approved for clinical screening or service eligibility.
+- **National:** All scored 2025 respondents with a valid FMD outcome, including those outside the two defined race-comparison groups. Thus the national table is **not** just the sum of the other two tables.
+
+The matrices report **unweighted respondent counts** and **survey-weighted percentages** separately. Weighted percentages are descriptive estimates; the notebook does not compute complex-survey confidence intervals for sensitivity or precision. Since the 2025 outcomes were inspected during earlier development, the threshold comparisons should be described as **post-hoc/exploratory**.
+
+## Setup and attach to run 0017
+
+```{r setup}
+# Reuse the same project root and module loader pattern as the run 0017 notebooks.
+find_project_root <- function(start = getwd()) {
+    current <- normalizePath(start, mustWork = TRUE)
+    repeat {
+        if (file.exists(file.path(current, "FMD_Project.Rproj"))) {
+            return(current)
+        }
+        parent <- dirname(current)
+        if (identical(parent, current)) {
+            stop("Open FMD_Project.Rproj in RStudio before running this notebook.")
+        }
+        current <- parent
+    }
+}
+
+project_root <- find_project_root()
+knitr::opts_knit$set(root.dir = project_root)
+
+load_module <- function(name) {
+    path <- file.path(project_root, "R", paste0(name, ".Rmd"))
+    text <- readLines(path, warn = FALSE)
+    starts <- which(startsWith(text, "```{r"))
+    ends <- which(trimws(text) == "```")
+    blocks <- lapply(starts, function(start) {
+        finish <- ends[ends > start][1]
+        if (is.na(finish) || finish <= start + 1L) {
+            stop("Missing code or closing fence in ", path)
+        }
+        paste(text[(start + 1L):(finish - 1L)], collapse = "\n")
+    })
+    eval(parse(text = paste(blocks, collapse = "\n\n")), envir = parent.frame())
+    invisible(TRUE)
+}
+
+load_module("config")
+load_module("run_manager")
+load_module("helpers")
+load_module("plot_palette")
+
+run_context <- attach_run()
+expected_run_id <- "0020"
+if (!identical(as.character(run_context$id), expected_run_id)) {
+    stop(
+        "This notebook was prepared for run 0017, but attach_run() selected ",
+        run_context$id,
+        ". Switch to the intended project run before continuing; ",
+        "do not combine predictions from different runs."
+    )
+}
+cat("[RUN] Attached to existing run:", run_context$id, "\n")
+```
+
+## Read saved predictions and audit eligibility
+
+The frozen model's probability is already stored as `selected_probability`. Race group was not one of the six input predictor groups; it is used here only to evaluate population-specific performance.
+
+```{r load-and-audit-saved-predictions}
+check_packages(c("data.table", "ggplot2", "scales"))
+
+scored <- data.table::as.data.table(load_run_rds("checkpoints", "07_scored_2025"))
+selection <- load_run_rds("models", "05_frozen_selection")
+
+needed <- c("FMD", "cohort", "RAW_WEIGHT", "selected_probability")
+missing_columns <- setdiff(needed, names(scored))
+if (length(missing_columns)) {
+    stop("Missing expected columns in scored checkpoint: ",
+         paste(missing_columns, collapse = ", "))
+}
+if (length(primary_groups) != 2L) {
+    stop("Expected exactly two primary_groups from the shared run configuration.")
+}
+
+eligible <- data.table::copy(scored[
+    valid_outcome(FMD) &
+    is.finite(RAW_WEIGHT) & RAW_WEIGHT > 0 &
+    is.finite(selected_probability) &
+    selected_probability >= 0 & selected_probability <= 1
+])
+
+excluded_n <- nrow(scored) - nrow(eligible)
+cat("Frozen 2023-selected classifier:", selection$chosen_family, "\n")
+cat("2025 scored records:", format(nrow(scored), big.mark = ","), "\n")
+cat("Valid outcome, weight, and prediction:",
+    format(nrow(eligible), big.mark = ","), "\n")
+cat("Excluded from confusion-matrix evaluation:",
+    format(excluded_n, big.mark = ","), "\n")
+
+for (group_name in primary_groups) {
+    cat(group_name, ": ",
+        format(sum(eligible$cohort == group_name, na.rm = TRUE), big.mark = ","),
+        " eligible respondents\n", sep = "")
+}
+
+if (!nrow(eligible) || !all(primary_groups %in% eligible$cohort)) {
+    stop("The 2025 checkpoint has no eligible respondents in one or more groups.")
+}
+if (!all(eligible$FMD %in% c(0, 1))) {
+    stop("FMD must be encoded 0/1 for confusion matrices.")
+}
+```
+
+## Fixed thresholds and confusion-matrix functions
+
+The same cutoffs are applied to all populations. With a relatively infrequent outcome such as FMD, lower cutoffs may recover more positive cases but may also introduce more false positives. We report sensitivity and specificity to show this tradeoff.
+
+```{r functions-and-thresholds}
+thresholds <- c(0.16, 0.20, 0.50)
+population_names <- c("National (all valid outcomes)", primary_groups)
+
+safe_ratio <- function(numerator, denominator) {
+    if (is.na(denominator) || denominator <= 0) return(NA_real_)
+    as.numeric(numerator / denominator)
+}
+
+make_population_matrix <- function(data, population_name, threshold) {
+    # Use distinct local names so data.table's actual/predicted columns
+    # cannot accidentally shadow the respondent vectors.
+    y_vec <- as.integer(data$FMD)
+    flag_vec <- as.integer(data$selected_probability >= threshold)
+    w_vec <- as.numeric(data$RAW_WEIGHT)
+
+    # Always create all four cells, even when the model predicts nobody positive.
+    cells <- data.table::CJ(actual = 0:1, predicted = 0:1)
+    cells[, unweighted_n := vapply(seq_len(nrow(cells)), function(i) {
+        sum(y_vec == cells$actual[i] & flag_vec == cells$predicted[i])
+    }, integer(1))]
+    cells[, weight_sum := vapply(seq_len(nrow(cells)), function(i) {
+        sum(w_vec[y_vec == cells$actual[i] & flag_vec == cells$predicted[i]])
+    }, numeric(1))]
+    cells[, `:=`(population = population_name, threshold = threshold)]
+    # Row percentage: within all respondents with the SAME actual FMD status.
+    cells[, weighted_row_share :=
+        safe_ratio(weight_sum, sum(weight_sum)), by = actual]
+    cells[, weighted_overall_share :=
+        safe_ratio(weight_sum, sum(weight_sum))]
+    cells[, unweighted_row_share :=
+        safe_ratio(unweighted_n, sum(unweighted_n)), by = actual]
+
+    cell_weight <- function(a, p) {
+        cells[actual == a & predicted == p, weight_sum]
+    }
+    cell_n <- function(a, p) {
+        cells[actual == a & predicted == p, unweighted_n]
+    }
+
+    tn <- cell_weight(0L, 0L)
+    fp <- cell_weight(0L, 1L)
+    fn <- cell_weight(1L, 0L)
+    tp <- cell_weight(1L, 1L)
+
+    summary <- data.table::data.table(
+        population = population_name,
+        threshold = threshold,
+        respondents = nrow(data),
+        actual_fmd_n = as.integer(cell_n(1L, 0L) + cell_n(1L, 1L)),
+        actual_no_fmd_n = as.integer(cell_n(0L, 0L) + cell_n(0L, 1L)),
+        observed_prevalence = safe_ratio(tp + fn, tn + fp + fn + tp),
+        fraction_flagged = safe_ratio(tp + fp, tn + fp + fn + tp),
+        sensitivity = safe_ratio(tp, tp + fn),
+        specificity = safe_ratio(tn, tn + fp),
+        precision_ppv = safe_ratio(tp, tp + fp),
+        negative_predictive_value = safe_ratio(tn, tn + fn),
+        accuracy = safe_ratio(tp + tn, tn + fp + fn + tp),
+        balanced_accuracy = (
+            safe_ratio(tp, tp + fn) + safe_ratio(tn, tn + fp)
+        ) / 2,
+        f1 = safe_ratio(2 * tp, 2 * tp + fp + fn),
+        true_positives_n = as.integer(cell_n(1L, 1L)),
+        false_negatives_n = as.integer(cell_n(1L, 0L)),
+        false_positives_n = as.integer(cell_n(0L, 1L)),
+        true_negatives_n = as.integer(cell_n(0L, 0L))
+    )
+
+    list(cells = cells, summary = summary)
+}
+```
+
+## Compute national and subgroup matrices
+
+For every population and threshold, the notebook saves a four-cell table and a metrics table. All percentages and performance measures use `RAW_WEIGHT`; raw cell counts are not weighted.
+
+```{r calculate-confusion-matrices}
+cell_results <- list()
+metric_results <- list()
+index <- 0L
+
+for (threshold in thresholds) {
+    for (population_name in population_names) {
+        index <- index + 1L
+        data <- if (identical(population_name, "National (all valid outcomes)")) {
+            eligible
+        } else {
+            eligible[cohort == population_name]
+        }
+        if (!nrow(data)) stop("No eligible respondents in ", population_name)
+        result <- make_population_matrix(data, population_name, threshold)
+        cell_results[[index]] <- result$cells
+        metric_results[[index]] <- result$summary
+    }
+}
+
+confusion_cells <- data.table::rbindlist(cell_results)
+confusion_metrics <- data.table::rbindlist(metric_results)
+
+# Preserve the run's population order for presentation tables and plots.
+confusion_cells[, population := factor(population, levels = population_names)]
+confusion_metrics[, population := factor(population, levels = population_names)]
+
+save_table(confusion_cells, "18_2025_confusion_matrix_cells")
+save_table(confusion_metrics, "18_2025_confusion_matrix_metrics")
+
+# Output one concise matrix per population and threshold.
+for (cutoff in thresholds) {
+    for (population_name in population_names) {
+        cat("\n", "Population: ", population_name,
+            " | Threshold: ", sprintf("%.2f", cutoff), "\n", sep = "")
+        show <- confusion_cells[
+            as.character(population) == population_name &
+            abs(confusion_cells$threshold - cutoff) < 1e-9,
+            .(
+                actual_FMD = actual,
+                predicted_FMD = predicted,
+                respondent_count = unweighted_n,
+                weighted_pct_of_actual_group = round(100 * weighted_row_share, 1)
+            )
+        ]
+        print(show)
+    }
+}
+```
+
+## Compare sensitivity, specificity, and other metrics
+
+**Sensitivity** is the survey-weighted fraction of respondents who reported FMD whom the model flagged. **Specificity** is the fraction of respondents who did not report FMD whom the model correctly left unflagged. **Precision** measures the percentage of positive model classifications that actually reported FMD; it depends partly on outcome prevalence. AUROC evaluates ranking across cutoffs, so it is **unchanged** when we choose a threshold for the confusion matrix.
+
+```{r compare-classification-metrics}
+metric_columns <- c(
+    "observed_prevalence", "fraction_flagged", "sensitivity", "specificity",
+    "precision_ppv", "negative_predictive_value", "accuracy",
+    "balanced_accuracy", "f1"
+)
+metrics_print <- data.table::copy(confusion_metrics)
+metrics_print[, (metric_columns) := lapply(.SD, function(x) round(100 * x, 1)),
+              .SDcols = metric_columns]
+print(metrics_print[, .(
+    population, threshold, respondents, actual_fmd_n,
+    observed_prevalence, fraction_flagged, sensitivity, specificity,
+    precision_ppv, accuracy, balanced_accuracy, f1
+)])
+cat("\nAll percentages in this summary are SURVEY-WEIGHTED except respondent counts.\n")
+cat("Uncertainty intervals are not calculated here.\n")
+```
+
+## Visualization: row-normalized confusion matrices
+
+Each tile shows the **survey-weighted percentage within the corresponding actual FMD group** and the **unweighted number of respondents**. For example, the upper-right cell (depending on plot orientation) should be interpreted by its printed "Actual FMD" and "Predicted FMD" labels, rather than position alone.
+
+```{r plot-classification-heatmaps}
+plot_cells <- data.table::copy(confusion_cells)
+plot_cells[, actual_label := factor(
+    ifelse(actual == 1L, "Actual FMD", "Actual no FMD"),
+    levels = c("Actual no FMD", "Actual FMD")
+)]
+plot_cells[, predicted_label := factor(
+    ifelse(predicted == 1L, "Predicted FMD", "Predicted no FMD"),
+    levels = c("Predicted no FMD", "Predicted FMD")
+)]
+plot_cells[, tile_label := paste0(
+    sprintf("%.1f%%", 100 * weighted_row_share),
+    "\n", "n = ", format(unweighted_n, big.mark = ",", scientific = FALSE)
+)]
+plot_cells[, text_color := ifelse(weighted_row_share >= 0.58, "white", "brown")]
+
+for (cutoff in thresholds) {
+    chart_data <- plot_cells[abs(plot_cells$threshold - cutoff) < 1e-9]
+    plot <- ggplot2::ggplot(
+        chart_data,
+        ggplot2::aes(x = predicted_label, y = actual_label, fill = weighted_row_share)
+    ) +
+        ggplot2::geom_tile(color = "#FFFFFF", linewidth = 1.8) +
+        ggplot2::geom_text(
+            ggplot2::aes(label = tile_label, color = text_color),
+            size = 3.9, lineheight = 1.25
+        ) +
+        ggplot2::scale_color_manual(
+            values = c(white = "#FFFFFF", brown = "#514138"),
+            guide = "none"
+        ) +
+        ggplot2::scale_fill_gradient(
+            low = "#F1EAE4", high = "#168F89",
+            labels = scales::percent_format(accuracy = 1),
+            limits = c(0, 1)
+        ) +
+        ggplot2::facet_wrap(~population, nrow = 1) +
+        ggplot2::coord_equal() +
+        atg_theme() +
+        ggplot2::theme(
+            axis.text.x = ggplot2::element_text(angle = 0, hjust = 0.5),
+            legend.position = "bottom",
+            strip.text = ggplot2::element_text(size = 10, face = "bold")
+        ) +
+        ggplot2::labs(
+            title = paste0("2025 FMD confusion matrices at cutoff ", sprintf("%.2f", cutoff)),
+            subtitle = "Weighted percentages within actual FMD groups; unweighted respondent counts shown",
+            x = "Model classification", y = "Reported outcome",
+            fill = "Weighted row share",
+            caption = paste(
+                "Selected nationally trained classifier:", selection$chosen_family,
+                "| Exploratory 2025 threshold audit; no survey-design intervals shown."
+            )
+        )
+    show_and_save(
+        plot,
+        paste0("18_2025_confusion_matrix_threshold_", sprintf("%02d", round(100 * cutoff))),
+        13, 5.5
+    )
+}
+```
+
+## Interpretation
+
+After running the notebook, read the **actual weighted values** from the summary table rather than assuming that a lower threshold is necessarily better.
+
+1. Report **sensitivity** first: among respondents reporting FMD, what proportion did the classifier identify?
+2. Compare it with **specificity**: how many respondents without FMD were correctly left unflagged?
+3. Explain the tradeoff among 0.16, 0.20, and 0.50 using both populations. A decision threshold for actual outreach or services would need a separate, prospective evaluation and community-defined priorities.
+4. Keep **AUROC** separate from threshold-based metrics. It summarizes model ranking performance over *all* cutoffs and does not change when we move the decision cutoff.
+5. Keep **prevalence** and **precision** in mind: even with unchanged sensitivity and specificity, positive predictive value can differ when the outcome is more or less common in a population.
+
+**Public-health interpretation:** These confusion matrices are an exploratory description of **classification of current self-reported distress in a later survey year**. They do not predict an individual's future crisis or suicide, establish a clinical screening threshold, or measure improvements from allocating services.
+
+## Reproducibility summary
+
+```{r reproducibility-summary}
+cat("[COMPLETE] Run ", run_context$id, ": selected model = ",
+    selection$chosen_family, "; thresholds = ",
+    paste(thresholds, collapse = ", "), "\n", sep = "")
+cat("Saved 18_2025_confusion_matrix_cells and 18_2025_confusion_matrix_metrics,\n")
+cat("plus both threshold figures in the current run output folders.\n")
+cat("No model fitting or recalibration was performed.\n")
+```
